@@ -8,7 +8,6 @@ import hashlib
 import os
 import pickle
 import typing
-import torch
 import time
 import random
 import itertools
@@ -16,7 +15,9 @@ import numpy as np
 import logging
 from typing import *
 
+import torch
 import torch.distributed as dist
+import torch.nn as nn
 
 from dataclasses import dataclass
 
@@ -175,3 +176,13 @@ def get_trainable_parameters(model: torch.nn.Module):
             trainable_params += num_params
 
     return trainable_params, all_param
+
+
+def compute_total_gradient_norm(model: nn.Module):
+    total_norm = 0
+    parameters = [p for p in model.parameters() if p.grad is not None]
+    for p in parameters:
+        param_norm = p.grad.detach().data.norm(2)
+        total_norm += param_norm.item() ** 2
+    total_norm = total_norm ** 0.5
+    return total_norm
