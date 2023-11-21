@@ -28,6 +28,7 @@ from mm_video.modeling.meter import Meter
 from mm_video.utils.train_utils import CudaPreFetcher, get_trainable_parameters, compute_total_gradient_norm
 from mm_video.utils.checkpoint import save_checkpoint, load_checkpoint, auto_resume, load_model, save_model
 from mm_video.utils.writer import get_writer
+from mm_video.utils.profile import Timer
 
 __all__ = ["BaseTrainer", "BaseTrainerConfig"]
 
@@ -334,10 +335,11 @@ class BaseTrainer:
         The histograms are written to TensorBoard under the tags:
         "weights/{parameter name}" and "grads/{parameter name}", respectively.
         """
-        for n, p in self.model.named_parameters():
-            self.writer.add_histogram(f"weight/{n}", p.detach().float(), global_step=self.global_step)
-            if p.grad is not None:
-                self.writer.add_histogram(f"grad/{n}", p.grad.detach().float(), global_step=self.global_step)
+        with Timer("Writing histogram..."):
+            for n, p in self.model.named_parameters():
+                self.writer.add_histogram(f"weight/{n}", p.detach().float(), global_step=self.global_step)
+                if p.grad is not None:
+                    self.writer.add_histogram(f"grad/{n}", p.grad.detach().float(), global_step=self.global_step)
 
     @torch.no_grad()
     def _write_total_gradient_norm(self):
@@ -347,8 +349,9 @@ class BaseTrainer:
         This function should be called before gradient clipping. The total gradient norm over all model parameters is
         computed, and written to TensorBoard under the tag "train/norm".
         """
-        total_norm = compute_total_gradient_norm(self.model)
-        self.writer.add_scalar("train/norm", total_norm, global_step=self.global_step)
+        with Timer("Writing total gradient norm..."):
+            total_norm = compute_total_gradient_norm(self.model)
+            self.writer.add_scalar("train/norm", total_norm, global_step=self.global_step)
 
     @torch.no_grad()
     def _write_loss_and_learning_rate(
