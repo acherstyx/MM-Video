@@ -8,13 +8,15 @@ import logging
 
 import torch
 import torch.nn as nn
-
+import torch.distributed.fsdp as fsdp
 
 from hydra.utils import instantiate
 from dataclasses import dataclass
 from enum import Enum
 from omegaconf import MISSING
 from typing import Any
+
+from mm_video.utils.profile import Timer
 
 __all__ = ["Parallelism", "ModelBuilderConfig", "build_model"]
 
@@ -23,9 +25,7 @@ logger = logging.getLogger(__name__)
 
 class Parallelism(Enum):
     CPU = "CPU"  # Only use CPU
-    GPU = "GPU"  # Use GPU
     DDP = "DDP"
-    DP = "DP"
     FSDP = "FSDP"
 
 
@@ -42,9 +42,8 @@ class ModelBuilderConfig:
 
 
 def build_model(cfg: ModelBuilderConfig):
-    logger.debug("Building the model from the configuration...")
-    model = instantiate(cfg.model)
-    logger.debug("Successfully built the model from the configuration.")
+    with Timer("Building the model from the configuration..."):
+        model = instantiate(cfg.model)
 
     # model parallelism
     logger.debug("Applying model parallelism...")
@@ -60,14 +59,12 @@ def build_model(cfg: ModelBuilderConfig):
             )
         elif cfg.parallelism == Parallelism.FSDP:
             logger.debug("Building FullyShardedDataParallel, check whether the program is hanging...")
-            raise NotImplementedError("FSPD is not supported yet.")
+            model = fsdp.FullyShardedDataParallel(
+                model,
+                cpu_offload=fsdp.CPUOffload(offload_params=True)
+            )
         else:
             raise RuntimeError(f"Model parallelism '{cfg.parallelism}' is not supported!")
-    elif cfg.parallelism == Parallelism.DP:
-        model = model.cuda()
-        model = nn.parallel.DataParallel(model)
-    elif cfg.parallelism == Parallelism.GPU:
-        model = model.cuda()
     elif cfg.parallelism == Parallelism.CPU:
         pass
     else:

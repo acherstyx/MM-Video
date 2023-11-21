@@ -18,20 +18,13 @@ from typing import *
 
 import torch.distributed as dist
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class SystemConfig:
-    multiprocess: bool = True
-    init_method: str = "tcp://localhost:2222"
-    num_gpu: int = torch.cuda.device_count()
-    gpu_devices: List[int] = field(default_factory=lambda: list(range(int(torch.cuda.device_count()))))
-    # multi-node training
-    num_shards: int = 1
-    shard_id: int = 0
     # deterministic
     deterministic: bool = True
     seed: int = 222
@@ -93,14 +86,6 @@ def manual_seed(cfg: SystemConfig):
         logger.warning("Manual seed is not used")
 
 
-def init_distributed(proc: int, cfg: SystemConfig):
-    if cfg.multiprocess:  # initialize multiprocess
-        word_size = cfg.num_gpu * cfg.num_shards
-        rank = cfg.num_gpu * cfg.shard_id + proc
-        dist.init_process_group(backend="nccl", init_method=cfg.init_method, world_size=word_size, rank=rank)
-        torch.cuda.set_device(cfg.gpu_devices[proc])
-
-
 def gather_object_multiple_gpu(list_object: List[Any], backend: AnyStr = "nccl", shared_folder=None,
                                retry=600, sleep=0.1):
     """
@@ -148,6 +133,22 @@ def gather_object_multiple_gpu(list_object: List[Any], backend: AnyStr = "nccl",
             gathered_list.extend(data)
         dist.barrier()
         return gathered_list
+
+
+def conditional_gather_object_multiple_gpu(
+        list_object: List[Any],
+        backend: AnyStr = "nccl", shared_folder=None, retry=600, sleep=0.1
+):
+    if dist.is_initialized():
+        return gather_object_multiple_gpu(
+            list_object=list_object,
+            backend=backend,
+            shared_folder=shared_folder,
+            retry=retry,
+            sleep=sleep
+        )
+    else:
+        return list_object
 
 
 # from peft: https://github.com/huggingface/peft/blob/main/src/peft/peft_model.py

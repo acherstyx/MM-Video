@@ -11,6 +11,7 @@ import torch
 from collections import defaultdict, deque
 import functools
 from tabulate import tabulate
+from typing import Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +29,21 @@ def format_time(s: float) -> str:
 
 
 class Timer(object):
-    def __init__(self, msg="", synchronize: bool = False, history_size: int = 1000, precision: int = 3):
-        """
+    start: float
+    last_checkpoint: float
+    time_history: Dict[str, deque]
 
-        :param msg:
+    def __init__(
+            self,
+            msg="",
+            synchronize: bool = False,
+            history_size: int = 1000,
+            precision: int = 3,
+            print_func: Callable = logger.debug
+    ):
+        """
+        Init and start timer
+        :param msg: Message to print before timing
         :param synchronize: Call `torch.cuda.synchronize()` when getting time
         :param history_size:
         :param precision: round seconds to a given precision in decimal digits to avoid verbose
@@ -39,39 +51,58 @@ class Timer(object):
         self.msg = msg
         self.synchronize = synchronize
         self.precision = precision
-
-        if self.msg:
-            logger.info("%s", msg)
-
-        self.start = self.get_time()
-        self.last_checkpoint = self.start
-
-        self.time_history = defaultdict(functools.partial(deque, maxlen=history_size))
+        self.print_func = print_func
         self.history_size = history_size
 
-    def get_time(self):
+        self.reset()
+
+        if self.msg:
+            self.print_func(msg)
+
+    @property
+    def averaged_time_history(self) -> Dict[str, float]:
+        return {name: np.mean(list(duration)).item() for name, duration in self.time_history.items()}
+
+    def _get_time(self) -> float:
+        """
+        call `torch.cuda.synchronize()` and return rounded time in seconds
+        :return: current time in seconds
+        """
         if self.synchronize and torch.cuda.is_available():
             torch.cuda.synchronize()
         return round(time.time(), self.precision)
 
     def reset(self):
-        self.last_checkpoint = self.get_time()
+        """
+        reset to the init status, restart timing
+        :return:
+        """
+        self.start = self._get_time()
+        self.last_checkpoint = self._get_time()
+        self.time_history = defaultdict(functools.partial(deque, maxlen=self.history_size))
+
+    def lap(self, name: Optional[str] = None):
+        if name is None:
+            name = f"Lap No. {len(self.time_history) + 1}"
+        current_time = self._get_time()
+        duration = (current_time - self.last_checkpoint)
+        self.last_checkpoint = current_time
+        self.time_history[name].append(duration)
+
+    def end(self):
+        duration = self._get_time() - self.start
+        if self.msg:
+            self.print_func(f"{self.msg} [took {format_time(duration)}]")
 
     def __enter__(self):
-        self.start = self.get_time()
+        self.start = self._get_time()
         return self
 
     def __exit__(self, typ, value, traceback):
-        self._duration = self.get_time() - self.start
-        if self.msg:
-            logger.info("%s [took %s]", self.msg, format_time(self._duration))
+        self.end()
 
-    def __call__(self, stage_name: str):
-        current_time = self.get_time()
-        duration = (current_time - self.last_checkpoint)
-        self.last_checkpoint = current_time
-        self.time_history[stage_name].append(duration)
-        return duration
+    def __call__(self, name: Optional[str] = None):
+        return self.lap(name=name)
 
     def get_info(self, averaged=True):
         return {
@@ -83,19 +114,21 @@ class Timer(object):
         return str(self.get_info())
 
     def print(self):
-        data = [[k, format_time(np.mean(v).item())] for k, v in self.time_history.items()]
+        data = [[name, format_time(duration)] for name, duration in self.averaged_time_history.items()]
         print(tabulate(data, headers=["Stage", "Time (ms)"], tablefmt="simple"))
 
 
 if __name__ == '__main__':
-    with Timer("Running...") as f:
+    logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    with Timer("Run as context manager...") as f:
         time.sleep(1.12)
 
-    timer = Timer()
+    timer = Timer("Run as function call...")
     time.sleep(0.5)
-    timer("s1")
+    timer.lap()
     time.sleep(0.21)
-    timer("s2")
+    timer.lap()
+    timer.end()
     timer.print()
     print(timer)
     print(timer.get_info())

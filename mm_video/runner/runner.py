@@ -21,7 +21,7 @@ from mm_video.utils.train_utils import manual_seed
 
 from mm_video.config import BaseConfig, register_runner_config
 from mm_video.data import DataLoaderConfig, build_loader
-from mm_video.modeling import ModelBuilderConfig, build_model, Parallelism
+from mm_video.modeling import ModelBuilderConfig, build_model
 from mm_video.trainer import BaseTrainerConfig, BaseTrainer
 from mm_video.modeling.meter import Meter, DummyMeter
 
@@ -99,9 +99,6 @@ class RunnerConfig:
             config_path=f"{os.path.dirname(os.path.abspath(__file__))}/../../configs")
 def main(cfg: BaseConfig):
     print(f"{get_timestamp()} => Run trainer")
-    # overwrite some config for torchrun
-    cfg.system.multiprocess = True
-    cfg.model_builder.parallelism = Parallelism.DDP
     runner = instantiate(cfg.runner, _partial_=True)(cfg)
     runner.run()
     print(f"{get_timestamp()} => Finished!")

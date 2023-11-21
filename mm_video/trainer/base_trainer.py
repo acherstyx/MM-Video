@@ -328,4 +328,4 @@ class BaseTrainerConfig:
     write_histogram: bool = False
     write_profiler: bool = False
     detect_anomaly: bool = False
-    output_dir: str = "${log.output_dir}"
+    output_dir: str = "${hydra:runtime.output_dir}"
