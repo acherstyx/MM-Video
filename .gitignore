@@ -157,4 +157,21 @@ cython_debug/
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+.idea/
+
+.DS_Store
+
+# Ignore experiment-specific code
+#  This directory contains code for individual experiments, excluded by default.
+#  Manually add experiments to the whitelist on their respective feature branches during development. Merge to the
+#  public main branch when ready for release after code cleaning.
+#  Example:
+#   !mm_video/experiments/exp1
+#   !configs/experiments/exp1
+#   !test/experiments/exp1
+mm_video/experiments/*
+configs/experiments/*
+test/experiments/*
+
+# Ignore datasets
+dataset/*
