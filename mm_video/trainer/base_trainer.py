@@ -136,27 +136,25 @@ class BaseTrainer:
         for epoch in range(self.epoch_start, self.epoch_total):
             self.epoch = epoch
             logger.debug(f"Epoch {epoch + 1}/{self.epoch_total}")
-            torch.cuda.empty_cache()
             if self.train_enable:
                 self._before_train_epoch()
                 self._on_train_epoch()
                 self._after_train_epoch()
             else:
                 logger.warning("Training is disabled!")
-            torch.cuda.empty_cache()
             if self.test_enable:
                 self._before_test_epoch()
                 self._on_test_epoch()
                 self._after_test_epoch()
             else:
                 logger.warning("Testing is disabled!")
-            torch.cuda.empty_cache()
 
     def _after_train(self):
         if not dist.is_initialized() or dist.get_rank() == 0:
             save_model(model_file=os.path.join(self.output_dir, "pytorch_model.bin"), model=self.model)
 
     def _before_train_epoch(self):
+        torch.cuda.empty_cache()
         if dist.is_initialized():
             dist.barrier()
         if "train_sampler" in self.dataloader:
@@ -165,15 +163,14 @@ class BaseTrainer:
 
     def _on_train_epoch(self):
         dataloader = self.dataloader["train"]
-        self.model.train()
         if torch.cuda.is_available():
             logger.debug("Building CudaPreFetcher...")
             dataloader = CudaPreFetcher(dataloader)  # prefetch to GPU
             logger.debug("CudaPreFetcher is built successfully.")
         progress_bar = tqdm(desc=f"Train: {self.epoch + 1}/{self.epoch_total}",
                             dynamic_ncols=True,
-                            disable=dist.is_initialized() and dist.get_rank() != 0,
-                            total=len(dataloader) // self.gradient_accumulation_step)
+                            total=len(dataloader) // self.gradient_accumulation_step,
+                            disable=dist.is_initialized() and dist.get_rank() != 0)
         prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(wait=5, warmup=5, active=5, repeat=1),
             on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join(self.output_dir, "profiler")),
@@ -289,17 +286,22 @@ class BaseTrainer:
                                 optimizer=self.optimizer,
                                 scheduler=self.scheduler,
                                 config=None)
+        torch.cuda.empty_cache()
 
     def _before_test_epoch(self):
+        torch.cuda.empty_cache()
         if dist.is_initialized():
             dist.barrier()
+        if "test_sampler" in self.dataloader:
+            logger.debug(f"set test sampler step to {self.epoch}")
+            self.dataloader["test_sampler"].set_epoch(self.epoch)
 
     @torch.no_grad()
     def _on_test_epoch(self):
         self.model.eval()
         dataloader = self.dataloader["test"]
-        dataloader = tqdm(dataloader, desc=f"Eval epoch {self.epoch + 1}", dynamic_ncols=True,
-                          disable=dist.is_initialized() and dist.get_rank() != 0)
+        progress_bar = tqdm(desc=f"Eval epoch {self.epoch + 1}", dynamic_ncols=True, total=len(dataloader),
+                            disable=dist.is_initialized() and dist.get_rank() != 0)
         if torch.cuda.is_available():
             dataloader = CudaPreFetcher(dataloader)  # move to GPU
         for inputs in dataloader:
@@ -308,11 +310,13 @@ class BaseTrainer:
                 inputs=inputs, outputs=outputs,
                 writer=self.writer, main_tag="test", global_step=self.epoch
             )
+            progress_bar.update()
 
     def _after_test_epoch(self):
         # write metric and reset meter
         self.meter.summary(writer=self.writer, main_tag="test", global_step=self.epoch)
         self.meter.reset()
+        torch.cuda.empty_cache()
 
     def train(self):
         self._before_train()
