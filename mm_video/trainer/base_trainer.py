@@ -5,13 +5,12 @@
 # @File    : base_trainer.py
 
 import os
-from abc import ABC, abstractmethod
 from tqdm import tqdm
 import logging
 
-from hydra.utils import instantiate
-from omegaconf import DictConfig
+from hydra.utils import get_object
 from dataclasses import field, dataclass
+from enum import Enum
 from typing import *
 
 import torch
@@ -19,9 +18,17 @@ from torch import nn, optim
 from torch.utils import data
 from torch.cuda.amp import GradScaler, autocast
 import torch.distributed as dist
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel,
+    CPUOffload
+)
+from torch.distributed.fsdp.wrap import (
+    transformer_auto_wrap_policy
+)
 
 from collections import defaultdict
 import contextlib
+from functools import partial
 
 from mm_video.config.registry import register_trainer_config
 from mm_video.modeling.meter import Meter
@@ -35,16 +42,83 @@ __all__ = ["BaseTrainer", "BaseTrainerConfig"]
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class DataLoaderConfig:
+    """DataLoader configuration options.
+
+    Attributes:
+        batch_size (int, optional): Batch size to use during training and evaluation, if not overriden.
+            Defaults to 1.
+        train_batch_size (int, optional): Batch size to use during training. Overrides `batch_size`, if set.
+            Defaults to the value of `batch_size`.
+        test_batch_size (int, optional): Batch size to use during testing. Overrides `batch_size`, if set.
+            Defaults to the value of `batch_size`.
+        eval_batch_size (int, optional): Batch size to use during evaluation. Overrides `batch_size`, if set.
+            Defaults to the value of `batch_size`.
+    """
+    collate_fn: Optional[str] = None
+
+    # batch size
+    batch_size: int = 1
+    train_batch_size: int = "${trainer.data_loader.batch_size}"
+    test_batch_size: int = "${trainer.data_loader.batch_size}"
+    eval_batch_size: int = "${trainer.data_loader.batch_size}"
+
+    num_workers: int = 0
+    shuffle: bool = True
+    prefetch_factor: Optional[int] = None
+    multiprocessing_context: str = "spawn"
+    pin_memory: bool = False
+
+
+class Parallelism(Enum):
+    CPU = "CPU"  # Only use CPU
+    DDP = "DDP"
+    FSDP = "FSDP"
+
+
+@dataclass
+class ModelBuilderConfig:
+    parallelism: Parallelism = Parallelism.DDP if torch.cuda.is_available() else Parallelism.CPU
+    ddp_find_unused_parameters: bool = False
+    fsdp_offload: bool = False
+    fsdp_transformer_layer_cls_to_wrap: Optional[List[str]] = None
+
+
+def get_module_class_from_name(module, name):
+    """
+    Gets a class from a module by its name.
+
+    Args:
+        module (`torch.nn.Module`): The module to get the class from.
+        name (`str`): The name of the class.
+    """
+    modules_children = list(module.children())
+    if module.__class__.__name__ == name:
+        return module.__class__
+    elif len(modules_children) == 0:
+        return
+    else:
+        for child_module in modules_children:
+            module_class = get_module_class_from_name(child_module, name)
+            if module_class is not None:
+                return module_class
+
+
 class BaseTrainer:
+    dataset: Dict[str, data.Dataset]
     dataloader: Dict[str, Union[data.DataLoader, data.distributed.DistributedSampler]]
     model: nn.Module
     optimizer: optim.Optimizer
     scheduler: Optional[optim.lr_scheduler.LRScheduler] = None
     meter: Meter
 
+    model_builder_config: ModelBuilderConfig
+
     def __init__(
             self,
-            dataloader, model, optimizer, scheduler, meter,
+            datasets: Dict[str, data.Dataset], model: nn.Module, optimizer, scheduler, meter,
+            data_loader, model_builder,
             test_enable: bool,
             train_enable: bool,
             epoch: int,
@@ -65,7 +139,10 @@ class BaseTrainer:
         assert write_histogram is None or not amp, \
             "If using AMP, `write_histogram_freq` cannot be enabled and must be set to `None`."
 
-        self.dataloader = dataloader
+        self.model_builder_config = model_builder
+
+        self.dataset = datasets
+        self.dataloader = self.build_loader(datasets, cfg=data_loader)
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -101,6 +178,90 @@ class BaseTrainer:
         self.gradient_accumulation_step = gradient_accumulation_steps
 
         self.info()
+
+    @staticmethod
+    def build_loader(datasets: Dict[str, data.Dataset], cfg: DataLoaderConfig):
+        assert all(split in ("train", "test", "eval") for split in datasets.keys()), \
+            f"Invalid split found in {datasets.keys()}. Must be one of 'train', 'test', or 'eval'."
+        timer = Timer(msg="Building dataloader...")
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        loader_and_sampler = {}
+        for split, dataset in datasets.items():
+            shuffle = cfg.shuffle if split == "train" else False
+            batch_size = getattr(cfg, f"{split}_batch_size")
+            collate_fn = get_object(cfg.collate_fn) if cfg.collate_fn is not None else None
+            sampler = data.distributed.DistributedSampler(dataset, shuffle=shuffle) if world_size > 1 else None
+            loader = data.DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=False if world_size > 1 else shuffle,
+                sampler=sampler,
+                num_workers=cfg.num_workers,
+                collate_fn=collate_fn,
+                pin_memory=cfg.pin_memory,
+                persistent_workers=False,
+                prefetch_factor=cfg.prefetch_factor,
+                multiprocessing_context=cfg.multiprocessing_context if cfg.num_workers else None
+            )
+            loader_and_sampler[split] = loader
+            if sampler is not None:
+                loader_and_sampler[f"{split}_sampler"] = sampler
+        timer.end()
+        return loader_and_sampler
+
+    def apply_parallelism(self, model: nn.Module, is_training: bool = True):
+        cfg = self.model_builder_config
+
+        # Move to GPU
+        if cfg.parallelism in (Parallelism.DDP, Parallelism.FSDP):
+            logger.debug("Moving model to device: %s...", torch.cuda.current_device())
+            model.cuda()
+
+        # Do not wrap model if not training
+        if not is_training:
+            return model
+
+        # model parallelism
+        logger.debug("Applying model parallelism...")
+        if cfg.parallelism in (Parallelism.DDP, Parallelism.FSDP):
+            logger.debug("Model is moved to device: %s", torch.cuda.current_device())
+            if cfg.parallelism == Parallelism.DDP:
+                logger.debug("Building DistributedDataParallel, check whether the program is hanging...")
+                model = nn.parallel.DistributedDataParallel(
+                    model,
+                    find_unused_parameters=cfg.ddp_find_unused_parameters
+                )
+            elif cfg.parallelism == Parallelism.FSDP:
+                logger.debug("Building FullyShardedDataParallel, check whether the program is hanging...")
+
+                # From Hugging Face Trainer
+                auto_wrap_policy = None
+                if cfg.fsdp_transformer_layer_cls_to_wrap is not None:
+                    transformer_cls_to_wrap = set()
+                    for layer_class in cfg.fsdp_transformer_layer_cls_to_wrap:
+                        transformer_cls = get_module_class_from_name(model, layer_class)
+                        if transformer_cls is None:
+                            raise Exception("Could not find the transformer layer class to wrap in the model.")
+                        else:
+                            transformer_cls_to_wrap.add(transformer_cls)
+                    auto_wrap_policy = partial(
+                        transformer_auto_wrap_policy,
+                        transformer_layer_cls=transformer_cls_to_wrap
+                    )
+
+                model = FullyShardedDataParallel(
+                    model,
+                    cpu_offload=CPUOffload(offload_params=cfg.fsdp_offload),
+                    auto_wrap_policy=auto_wrap_policy
+                )
+            else:
+                raise RuntimeError(f"Model parallelism '{cfg.parallelism}' is not supported!")
+        elif cfg.parallelism == Parallelism.CPU:
+            pass
+        else:
+            raise RuntimeError(f"Model parallelism '{cfg.parallelism}' is not supported!")
+        logger.debug("Successfully applied model parallelism.")
+        return model
 
     def info(self):
         """CUSTOMIZE: to print some information"""
@@ -163,7 +324,10 @@ class BaseTrainer:
             self.dataloader["train_sampler"].set_epoch(self.epoch)
 
     def _on_train_epoch(self):
+        # Get training data and model
         dataloader = self.dataloader["train"]
+        model = self.apply_parallelism(self.model)
+
         if torch.cuda.is_available():
             logger.debug("Building CudaPreFetcher...")
             dataloader = CudaPreFetcher(dataloader)  # prefetch to GPU
@@ -186,7 +350,7 @@ class BaseTrainer:
 
         logger.debug("Running train epoch for-loop...")
         for cur_step, inputs in enumerate(dataloader):
-            outputs, loss, loss_meta = self._train_step(inputs=inputs)
+            outputs, loss, loss_meta = self._train_step(model=model, inputs=inputs)
 
             loss_total += loss
             for k, v in loss_meta.items():
@@ -211,13 +375,13 @@ class BaseTrainer:
                 # optimize
                 if not self.enable_amp:
                     if self.clip_norm is not None:  # clip by norm
-                        nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_norm)
+                        nn.utils.clip_grad_norm_(model.parameters(), self.clip_norm)
                     self.optimizer.step()
                     self.optimizer.zero_grad()
                 else:
                     if self.clip_norm is not None:  # clip by norm
                         self.scaler.unscale_(self.optimizer)
-                        nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_norm)
+                        nn.utils.clip_grad_norm_(model.parameters(), self.clip_norm)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                     self.optimizer.zero_grad()
@@ -237,11 +401,14 @@ class BaseTrainer:
         if self.write_profiler:
             prof.stop()
 
-    def _train_step(self, inputs: Dict[str, Union[torch.Tensor, Any]]):
+    def _train_step(
+            self,
+            model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Performs a single training step on the model.
         """
-        self.model.train()
+        model.train()
 
         if self.enable_amp:
             autocast_context_manager = autocast()
@@ -250,7 +417,7 @@ class BaseTrainer:
 
         # Forward pass
         with autocast_context_manager:
-            outputs = self.model(inputs)
+            outputs = model(inputs)
             assert "loss" in outputs, \
                 "The model forward function should return a dictionary with the key `loss` during training."
             loss = outputs["loss"]
@@ -299,14 +466,15 @@ class BaseTrainer:
 
     @torch.no_grad()
     def _on_test_epoch(self):
-        self.model.eval()
+        model = self.apply_parallelism(self.model, is_training=False)
+        model.eval()
         dataloader = self.dataloader["test"]
         progress_bar = tqdm(desc=f"Eval epoch {self.epoch + 1}", dynamic_ncols=True, total=len(dataloader),
                             disable=dist.is_initialized() and dist.get_rank() != 0)
         if torch.cuda.is_available():
             dataloader = CudaPreFetcher(dataloader)  # move to GPU
         for inputs in dataloader:
-            outputs = self.model(inputs)
+            outputs = model(inputs)
             self.meter.update(
                 inputs=inputs, outputs=outputs,
                 writer=self.writer, main_tag="test", global_step=self.epoch
@@ -325,6 +493,7 @@ class BaseTrainer:
         self._after_train()
 
     def eval(self):
+        # TODO: Add evaluation
         pass
 
     @torch.no_grad()
@@ -385,10 +554,13 @@ class BaseTrainer:
         )
 
 
-@register_trainer_config(name=f"{BaseTrainer.__qualname__}")
+@register_trainer_config(name=f"{BaseTrainer.__name__}")
 @dataclass
 class BaseTrainerConfig:
     _target_: str = f"{__name__}.{BaseTrainer.__qualname__}"
+
+    data_loader: DataLoaderConfig = field(default_factory=DataLoaderConfig)
+    model_builder: ModelBuilderConfig = field(default_factory=ModelBuilderConfig)
 
     # Enable/Disable train/test loop
     train_enable: bool = True
