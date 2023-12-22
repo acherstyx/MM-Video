@@ -143,7 +143,7 @@ class BaseTrainer:
 
         self.dataset = datasets
         self.dataloader = self.build_loader(datasets, cfg=data_loader)
-        self.model = model
+        self.model = self._wrap_model(model)
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.meter = meter
@@ -209,7 +209,7 @@ class BaseTrainer:
         timer.end()
         return loader_and_sampler
 
-    def apply_parallelism(self, model: nn.Module, is_training: bool = True):
+    def _wrap_model(self, model: nn.Module, is_training: bool = True):
         cfg = self.model_builder_config
 
         # Move to GPU
@@ -219,6 +219,7 @@ class BaseTrainer:
 
         # Do not wrap model if not training
         if not is_training:
+            logger.debug("Not training, return unwrapped model.")
             return model
 
         # model parallelism
@@ -326,7 +327,7 @@ class BaseTrainer:
     def _on_train_epoch(self):
         # Get training data and model
         dataloader = self.dataloader["train"]
-        model = self.apply_parallelism(self.model)
+        model = self.model
 
         if torch.cuda.is_available():
             logger.debug("Building CudaPreFetcher...")
@@ -343,6 +344,7 @@ class BaseTrainer:
             with_stack=False
         )
         if self.write_profiler:
+            logger.warning("Torch profiler is enabled, performance may be impacted.")
             prof.start()
 
         loss_total = 0.0
@@ -446,35 +448,38 @@ class BaseTrainer:
         self.meter.summary(writer=self.writer, main_tag="train", global_step=self.global_step)
         self.meter.reset()
         # save checkpoint
-        if (self.epoch + 1) % self.save_freq == 0:
-            if not dist.is_initialized() or dist.get_rank() == 0:  # ddp is not enabled or global rank is 0
-                save_checkpoint(ckpt_folder=os.path.join(self.output_dir, "checkpoint"),
-                                epoch=self.epoch + 1,
-                                model=self.model,
-                                optimizer=self.optimizer,
-                                scheduler=self.scheduler,
-                                config=None)
+        if (self.epoch + 1) % self.save_freq == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
+            logger.debug("Saving checkpoint...")
+            checkpoint_dir = os.path.join(self.output_dir, "checkpoint")
+            save_checkpoint(ckpt_folder=checkpoint_dir,
+                            epoch=self.epoch + 1,
+                            model=self.model,
+                            optimizer=self.optimizer,
+                            scheduler=self.scheduler,
+                            config=None)
+            logger.info("Checkpoint is saved to %s", checkpoint_dir)
         torch.cuda.empty_cache()
 
     def _before_test_epoch(self):
         torch.cuda.empty_cache()
         if dist.is_initialized():
+            logger.debug("Reach test epoch start barrier.")
             dist.barrier()
+            logger.debug("Entering test loop...")
         if "test_sampler" in self.dataloader:
             logger.debug(f"set test sampler step to {self.epoch}")
             self.dataloader["test_sampler"].set_epoch(self.epoch)
 
     @torch.no_grad()
     def _on_test_epoch(self):
-        model = self.apply_parallelism(self.model, is_training=False)
-        model.eval()
+        self.model.eval()
         dataloader = self.dataloader["test"]
         progress_bar = tqdm(desc=f"Eval epoch {self.epoch + 1}", dynamic_ncols=True, total=len(dataloader),
                             disable=dist.is_initialized() and dist.get_rank() != 0)
         if torch.cuda.is_available():
             dataloader = CudaPreFetcher(dataloader)  # move to GPU
         for inputs in dataloader:
-            outputs = model(inputs)
+            outputs = self.model(inputs)
             self.meter.update(
                 inputs=inputs, outputs=outputs,
                 writer=self.writer, main_tag="test", global_step=self.epoch
