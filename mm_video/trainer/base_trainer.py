@@ -33,7 +33,7 @@ from functools import partial
 from mm_video.config.registry import register_trainer_config
 from mm_video.modeling.meter import Meter
 from mm_video.utils.train_utils import (
-    CudaPreFetcher, get_trainable_parameters, compute_total_gradient_norm, get_module_class_from_name
+    CudaPreFetcher, get_trainable_parameters, compute_total_gradient_norm, get_module_class_from_name, get_world_size
 )
 from mm_video.utils.checkpoint import (
     auto_resume, load_model, unwrap_model
@@ -73,9 +73,9 @@ class DataLoaderConfig:
 
     # batch size
     batch_size: int = 1
-    train_batch_size: int = "${trainer.data_loader.batch_size}"
-    test_batch_size: int = "${trainer.data_loader.batch_size}"
-    eval_batch_size: int = "${trainer.data_loader.batch_size}"
+    train_batch_size: Optional[int] = None
+    test_batch_size: Optional[int] = None
+    eval_batch_size: Optional[int] = None
 
     num_workers: int = 0
     shuffle: bool = True
@@ -84,16 +84,18 @@ class DataLoaderConfig:
     pin_memory: bool = False
 
 
-class Parallelism(Enum):
+class TrainingStrategy(Enum):
     CPU = "CPU"  # Only use CPU
     DDP = "DDP"
     FSDP = "FSDP"
 
 
 @dataclass
-class ModelBuilderConfig:
-    parallelism: Parallelism = Parallelism.DDP if torch.cuda.is_available() else Parallelism.CPU
+class TrainingStrategyConfig:
+    strategy: TrainingStrategy = TrainingStrategy.DDP if torch.cuda.is_available() else TrainingStrategy.CPU
+
     ddp_find_unused_parameters: bool = False
+
     fsdp_offload: bool = False
     fsdp_transformer_layer_cls_to_wrap: Optional[List[str]] = None
 
@@ -104,7 +106,7 @@ class TrainingConfig:
     do_test: bool = False
     do_eval: bool = False  # TODO: Not implemented yet.
 
-    epoch: int = 5
+    num_train_epochs: int = 5
 
     amp: bool = False
 
@@ -144,50 +146,37 @@ class TrainingConfig:
 class BaseTrainerConfig:
     _target_: str = f"{__name__}.BaseTrainer"
 
-    data_loader: DataLoaderConfig = field(default_factory=DataLoaderConfig)
-    model_builder: ModelBuilderConfig = field(default_factory=ModelBuilderConfig)
-
     training_config: TrainingConfig = field(default_factory=TrainingConfig)
+    dataloader_config: DataLoaderConfig = field(default_factory=DataLoaderConfig)
+    training_strategy_config: TrainingStrategyConfig = field(default_factory=TrainingStrategyConfig)
 
 
 class BaseTrainer:
-    dataset: Dict[str, data.Dataset]
-    dataloader: Dict[str, Union[data.DataLoader, data.distributed.DistributedSampler]]
-    model: nn.Module
-    optimizer: optim.Optimizer
-    scheduler: Optional[optim.lr_scheduler.LRScheduler] = None
-    meter: Meter
-
-    model_builder_config: ModelBuilderConfig
-
     def __init__(
             self,
-            datasets: Dict[str, data.Dataset], model: nn.Module, meter,
-            data_loader, model_builder, training_config: TrainingConfig,
+            dataloader_config: DataLoaderConfig,
+            training_strategy_config: TrainingStrategyConfig,
+            training_config: TrainingConfig,
+            datasets: Dict[str, data.Dataset], model: nn.Module, meter: Meter,
             optimizer: Optional[optim.Optimizer] = None,
             scheduler: Optional[optim.lr_scheduler.LRScheduler] = None
     ):
-        cfg = training_config
-        self.cfg = cfg
+        cfg: TrainingConfig = training_config
+        self.cfg: TrainingConfig = cfg
+        self.dataloader_cfg: DataLoaderConfig = dataloader_config
+        self.training_strategy_cfg: TrainingStrategyConfig = training_strategy_config
 
         assert cfg.write_histogram is None or not cfg.amp, \
             "If using AMP, `write_histogram_freq` cannot be enabled and must be set to `None`."
 
-        self.model_builder_config = model_builder
-
         self.dataset = datasets
-        self.dataloader = self.build_loader(datasets, cfg=data_loader)
+        self.dataloader = self.build_loader(datasets, cfg=dataloader_config)
         self.model_wrapped = self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.meter = meter
 
         torch.autograd.set_detect_anomaly(cfg.detect_anomaly)
-
-        self.do_train = cfg.do_train
-        self.do_test = cfg.do_test
-
-        self.debug = cfg.debug
 
         self.resume = cfg.resume
         self.auto_resume = cfg.auto_resume
@@ -198,7 +187,6 @@ class BaseTrainer:
             assert x is None or type(x) is int
             return float("inf") if x is None else x
 
-        self.write_profiler = cfg.write_profiler
         self.write_loss_and_learning_rate_freq = get_write_freq(cfg.write_loss_and_learning_rate)
         self.write_histogram_freq = get_write_freq(cfg.write_histogram)
         self.write_gradient_norm_freq = get_write_freq(cfg.write_gradient_norm)
@@ -207,7 +195,7 @@ class BaseTrainer:
         self.scaler: GradScaler = GradScaler() if cfg.amp else None
         self.clip_norm = cfg.clip_norm
 
-        self.epoch_total = cfg.epoch
+        self.epoch_total = cfg.num_train_epochs
         self.global_step = self.epoch = 0  # Init to 0
 
         self.gradient_accumulation_step = cfg.gradient_accumulation_steps
@@ -309,13 +297,17 @@ class BaseTrainer:
         assert all(split in ("train", "test", "eval") for split in datasets.keys()), \
             f"Invalid split found in {datasets.keys()}. Must be one of 'train', 'test', or 'eval'."
         timer = Timer(msg="Building dataloader...")
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        world_size = get_world_size()
         loader_and_sampler = {}
         for split, dataset in datasets.items():
             shuffle = cfg.shuffle if split == "train" else False
             batch_size = getattr(cfg, f"{split}_batch_size")
+            if batch_size is None:
+                batch_size = getattr(cfg, "batch_size")
             collate_fn = get_object(cfg.collate_fn) if cfg.collate_fn is not None else None
+
             sampler = data.distributed.DistributedSampler(dataset, shuffle=shuffle) if world_size > 1 else None
+
             loader = data.DataLoader(
                 dataset,
                 batch_size=batch_size,
@@ -328,6 +320,7 @@ class BaseTrainer:
                 prefetch_factor=cfg.prefetch_factor,
                 multiprocessing_context=cfg.multiprocessing_context if cfg.num_workers else None
             )
+
             loader_and_sampler[split] = loader
             if sampler is not None:
                 loader_and_sampler[f"{split}_sampler"] = sampler
@@ -335,10 +328,10 @@ class BaseTrainer:
         return loader_and_sampler
 
     def _wrap_model(self, model: nn.Module, is_training: bool = True):
-        cfg = self.model_builder_config
+        cfg = self.training_strategy_cfg
 
         # Move to GPU
-        if cfg.parallelism in (Parallelism.DDP, Parallelism.FSDP):
+        if cfg.strategy in (TrainingStrategy.DDP, TrainingStrategy.FSDP):
             logger.debug("Moving model to device: %s...", torch.cuda.current_device())
             model.cuda()
 
@@ -347,17 +340,17 @@ class BaseTrainer:
             logger.debug("Not training, return unwrapped model.")
             return model
 
-        # model parallelism
-        logger.debug("Applying model parallelism...")
-        if cfg.parallelism in (Parallelism.DDP, Parallelism.FSDP):
+        # wrap model
+        logger.debug("Applying training strategy...")
+        if cfg.strategy in (TrainingStrategy.DDP, TrainingStrategy.FSDP):
             logger.debug("Model is moved to device: %s", torch.cuda.current_device())
-            if cfg.parallelism == Parallelism.DDP:
+            if cfg.strategy == TrainingStrategy.DDP:
                 logger.debug("Building DistributedDataParallel, check whether the program is hanging...")
                 model = nn.parallel.DistributedDataParallel(
                     model,
                     find_unused_parameters=cfg.ddp_find_unused_parameters
                 )
-            elif cfg.parallelism == Parallelism.FSDP:
+            elif cfg.strategy == TrainingStrategy.FSDP:
                 logger.debug("Building FullyShardedDataParallel, check whether the program is hanging...")
 
                 # From Hugging Face Trainer
@@ -381,12 +374,12 @@ class BaseTrainer:
                     auto_wrap_policy=auto_wrap_policy
                 )
             else:
-                raise RuntimeError(f"Model parallelism '{cfg.parallelism}' is not supported!")
-        elif cfg.parallelism == Parallelism.CPU:
+                raise RuntimeError(f"Training strategy '{cfg.strategy}' is not supported!")
+        elif cfg.strategy == TrainingStrategy.CPU:
             pass
         else:
-            raise RuntimeError(f"Model parallelism '{cfg.parallelism}' is not supported!")
-        logger.debug("Successfully applied model parallelism.")
+            raise RuntimeError(f"Training strategy '{cfg.strategy}' is not supported!")
+        logger.debug("Model is wrapped successfully.")
         return model
 
     def info(self):
@@ -433,13 +426,13 @@ class BaseTrainer:
         for epoch in range(self.epoch, self.epoch_total):
             self.epoch = epoch
             logger.debug(f"Epoch {epoch + 1}/{self.epoch_total}")
-            if self.do_train:
+            if self.cfg.do_train:
                 self._before_train_epoch()
                 self._on_train_epoch()
                 self._after_train_epoch()
             else:
                 logger.warning("Training is disabled!")
-            if self.do_test:
+            if self.cfg.do_test:
                 self._before_test_epoch()
                 self._on_test_epoch()
                 self._after_test_epoch()
@@ -478,7 +471,7 @@ class BaseTrainer:
             record_shapes=False,
             with_stack=False
         )
-        if self.write_profiler:
+        if self.cfg.write_profiler:
             logger.warning("Torch profiler is enabled, performance may be impacted.")
             prof.start()
 
@@ -515,7 +508,7 @@ class BaseTrainer:
                     if self.enable_amp:
                         self.scaler.unscale_(self.optimizer)
 
-                    if self.model_builder_config.parallelism == Parallelism.FSDP:
+                    if self.training_strategy_cfg.strategy == TrainingStrategy.FSDP:
                         nn.utils.clip_grad_norm_(model.parameters(), self.clip_norm)
                     else:
                         model.clip_grad_norm_(self.clip_norm)
@@ -534,13 +527,13 @@ class BaseTrainer:
                 loss_total = 0.
                 loss_meta_total = defaultdict(float)
                 progress_bar.update()
-                if self.write_profiler:
+                if self.cfg.write_profiler:
                     prof.step()
-            if self.debug and cur_step + 1 >= 100 * self.gradient_accumulation_step:
+            if self.cfg.debug and cur_step + 1 >= 100 * self.gradient_accumulation_step:
                 logger.warning("Debug mode is enabled, only run for 100 step.")
                 break
         logger.debug("Train epoch for-loop finished.")
-        if self.write_profiler:
+        if self.cfg.write_profiler:
             prof.stop()
 
     def _train_step(

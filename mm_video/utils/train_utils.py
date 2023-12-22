@@ -208,3 +208,11 @@ def get_module_class_from_name(module, name):
             module_class = get_module_class_from_name(child_module, name)
             if module_class is not None:
                 return module_class
+
+
+def get_world_size() -> int:
+    """
+    Get world size from environment variable set by `torchrun`.
+
+    """
+    return int(os.environ.get("WORLD_SIZE", 1))
