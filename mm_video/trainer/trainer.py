@@ -669,8 +669,15 @@ class Trainer:
             logger.debug(f"Set eval sampler step to 0")
             self.dataloader["eval_sampler"].set_epoch(0)
 
+        # Resume from specified model, use for load pretrained weight
+        if self.resume is not None:
+            logger.info(f"Resume model parameters from {self.resume}.")
+            load_state_dict(self.model_wrapped, model_file=self.resume, strict=False)
+
+        self.writer = get_writer(os.path.join(self.output_dir, "tensorboard"))
+
     def _on_eval(self):
-        model = self.model_wrapped
+        model = self._wrap_model(self.model_wrapped, training=False)
         dataloader = self._prefetch_to_gpu(self.dataloader["eval"])
 
         process_bar = tqdm(desc="Evaluation", dynamic_ncols=True, total=len(dataloader),

@@ -7,7 +7,6 @@
 import hashlib
 import os
 import pickle
-import typing
 import time
 import random
 import itertools
@@ -31,6 +30,22 @@ class SystemConfig:
     seed: int = 222
 
 
+def cuda(x: Union[torch.Tensor, Dict, List]):
+    """
+    Recursively move to GPU
+    :param x:
+    :return:
+    """
+    if isinstance(x, list) or isinstance(x, tuple):
+        return [cuda(i) for i in x]
+    elif isinstance(x, dict):
+        return {k: cuda(v) for k, v in x.items()}
+    elif isinstance(x, torch.Tensor):
+        return x.cuda(non_blocking=True)
+    else:
+        return x
+
+
 class CudaPreFetcher:
     def __init__(self, data_loader):
         self.dl = data_loader
@@ -48,15 +63,8 @@ class CudaPreFetcher:
             self.batch = self.cuda(self.batch)
 
     @staticmethod
-    def cuda(x: typing.Any):
-        if isinstance(x, list) or isinstance(x, tuple):
-            return [CudaPreFetcher.cuda(i) for i in x]
-        elif isinstance(x, dict):
-            return {k: CudaPreFetcher.cuda(v) for k, v in x.items()}
-        elif isinstance(x, torch.Tensor):
-            return x.cuda(non_blocking=True)
-        else:
-            return x
+    def cuda(x: Any):
+        return cuda(x)
 
     def __next__(self):
         torch.cuda.current_stream().wait_stream(self.stream)

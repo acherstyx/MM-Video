@@ -28,3 +28,5 @@ hydra:
         level: DEBUG
         handlers: [ file ]
         propagate: no
+    root:
+      handlers: [ ]
