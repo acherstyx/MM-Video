@@ -27,7 +27,7 @@ class BaseConfig:
     defaults: List[Any] = field(
         default_factory=lambda: [
             "_self_",
-            {"trainer": "BaseTrainer"},
+            {"trainer": "Trainer"},
             {"runner": "Runner"}
         ]
     )

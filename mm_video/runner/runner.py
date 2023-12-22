@@ -20,7 +20,7 @@ from mm_video.utils.logging import get_timestamp
 from mm_video.utils.train_utils import manual_seed
 
 from mm_video.config import BaseConfig, register_runner_config
-from mm_video.trainer import BaseTrainerConfig, BaseTrainer
+from mm_video.trainer import TrainerConfig, Trainer
 from mm_video.modeling.meter import Meter, DummyMeter
 from mm_video.utils.profile import Timer
 
@@ -36,7 +36,7 @@ class Runner:
     dataset: Dict[str, data.Dataset]
     model: nn.Module
     meter: Meter
-    trainer: BaseTrainer
+    trainer: Trainer
 
     def __init__(self, cfg: BaseConfig):
         dist.init_process_group(backend="nccl")
@@ -63,7 +63,7 @@ class Runner:
             logger.info("Meter is not specified.")
             self.meter = DummyMeter()
 
-    def build_trainer(self, trainer_config: BaseTrainerConfig):
+    def build_trainer(self, trainer_config: TrainerConfig):
         self.trainer = instantiate(trainer_config)(
             datasets=self.dataset, model=self.model,
             meter=self.meter
@@ -83,7 +83,5 @@ class RunnerConfig:
 @hydra.main(version_base=None, config_name="config",
             config_path=f"{os.path.dirname(os.path.abspath(__file__))}/../../configs")
 def main(cfg: BaseConfig):
-    print(f"{get_timestamp()} => Execution started.")
     runner = instantiate(cfg.runner, _partial_=True)(cfg)
     runner.run()
-    print(f"{get_timestamp()} => Execution finished.")

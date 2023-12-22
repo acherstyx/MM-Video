@@ -2,8 +2,9 @@
 # @Time    : 2022/11/12 22:28
 # @Author  : Yaojie Shen
 # @Project : MM-Video
-# @File    : base_trainer.py
+# @File    : trainer.py
 import glob
+import math
 import os
 import re
 
@@ -34,17 +35,18 @@ from functools import partial
 
 from mm_video.config.registry import register_trainer_config
 from mm_video.modeling.meter import Meter
+from mm_video.modeling.optimization import get_linear_schedule_with_warmup
 from mm_video.utils.train_utils import (
-    CudaPreFetcher, get_trainable_parameters, compute_total_gradient_norm, get_module_class_from_name, get_world_size
+    CudaPreFetcher, get_trainable_parameters, compute_total_gradient_norm, get_world_size
 )
-from mm_video.utils.checkpoint import (
-    load_model, unwrap_model
-)
+from mm_video.utils.checkpoint import load_model, unwrap_model
 from mm_video.utils.writer import get_writer
 from mm_video.utils.profile import Timer
 
+from .trainer_utils import barrier, get_module_class_from_name
+
 __all__ = [
-    "BaseTrainer", "BaseTrainerConfig",
+    "Trainer", "TrainerConfig",
     "TrainingStrategy", "TrainingStrategyConfig", "DataLoaderConfig", "TrainingConfig"
 ]
 
@@ -90,14 +92,14 @@ class DataLoaderConfig:
 
 
 class TrainingStrategy(Enum):
-    CPU = "CPU"  # Only use CPU
-    DDP = "DDP"
-    FSDP = "FSDP"
+    cpu = "cpu"
+    ddp = "ddp"
+    fsdp = "fsdp"
 
 
 @dataclass
 class TrainingStrategyConfig:
-    strategy: TrainingStrategy = TrainingStrategy.DDP if torch.cuda.is_available() else TrainingStrategy.CPU
+    strategy: TrainingStrategy = TrainingStrategy.ddp if torch.cuda.is_available() else TrainingStrategy.cpu
 
     ddp_find_unused_parameters: bool = False
 
@@ -109,7 +111,7 @@ class TrainingStrategyConfig:
 class TrainingConfig:
     do_train: bool = False
     do_test: bool = False
-    do_eval: bool = False  # TODO: Not implemented yet.
+    do_eval: bool = False
 
     num_train_epochs: int = 5
 
@@ -119,6 +121,8 @@ class TrainingConfig:
 
     # Resume model from pretrained parameters
     resume: Optional[str] = None
+    # Resume from last checkpoint saved in output directory
+    resume_from_checkpoint: bool = False
 
     detect_anomaly: bool = False
 
@@ -139,16 +143,16 @@ class TrainingConfig:
 
     # Optimizer and Scheduler options
     learning_rate: float = 1e-5
-    warmup_ratio: float = 0.0
-    warmup_steps: int = 0
+    warmup_ratio: Optional[float] = None
+    warmup_steps: Optional[int] = None
 
     gradient_accumulation_steps: int = 1
 
 
-@register_trainer_config(name=f"BaseTrainer")
+@register_trainer_config(name=f"Trainer")
 @dataclass
-class BaseTrainerConfig:
-    _target_: str = f"{__name__}.BaseTrainer"
+class TrainerConfig:
+    _target_: str = f"{__name__}.Trainer"
     _partial_: bool = True
 
     training_config: TrainingConfig = field(default_factory=TrainingConfig)
@@ -156,7 +160,7 @@ class BaseTrainerConfig:
     training_strategy_config: TrainingStrategyConfig = field(default_factory=TrainingStrategyConfig)
 
 
-class BaseTrainer:
+class Trainer:
     def __init__(
             self,
             dataloader_config: DataLoaderConfig,
@@ -209,23 +213,30 @@ class BaseTrainer:
         self.info()
 
     def create_optimizer(self):
+        logger.debug("Creating optimizer...")
         self.optimizer = optim.AdamW(self.model_wrapped.parameters(), lr=self.cfg.learning_rate)
+        logger.info("Optimizer created successfully.")
 
     def create_scheduler(self, optimizer: optim.Optimizer):
-        self.scheduler = None  # TODO: Support warmup scheduler
+        logger.debug("Creating scheduler...")
+        max_train_steps = math.ceil(len(self.dataloader["train"]) * self.epoch_total / self.gradient_accumulation_step)
+
+        warmup_steps = 0
+        assert (self.cfg.warmup_ratio is None) or (self.cfg.warmup_steps is None), \
+            "Both warmup_ratio and warmup_steps should not be set simultaneously."
+        if self.cfg.warmup_ratio is not None:
+            warmup_steps = int(max_train_steps * self.cfg.warmup_ratio)
+        if self.cfg.warmup_steps is not None:
+            warmup_steps = self.cfg.warmup_steps
+
+        self.scheduler = get_linear_schedule_with_warmup(optimizer=optimizer,
+                                                         num_warmup_steps=warmup_steps,
+                                                         num_training_steps=max_train_steps)
+        logger.info("Scheduler created successfully. Warmup steps: %d", warmup_steps)
 
     @property
     def should_write(self) -> bool:
         return not dist.is_initialized() or dist.get_rank() == 0
-
-    @staticmethod
-    def _barrier(debug_msg: Optional[str] = None):
-        if dist.is_initialized():
-            if debug_msg is not None:
-                logger.debug("Reached the '%s' barrier, waiting for other processes.", debug_msg)
-            dist.barrier()
-            if debug_msg is not None:
-                logger.debug("Exited the '%s' barrier.", debug_msg)
 
     def save_model(self, output_dir: Optional[str] = None, state_dict: Optional[Any] = None):
         """
@@ -295,7 +306,9 @@ class BaseTrainer:
 
         logger.info("Checkpoint is loaded successfully.")
 
-    def _get_last_checkpoint(self) -> str:
+        # TODO: skip epoch and set train step after load checkpoint
+
+    def _get_last_checkpoint(self) -> Optional[str]:
         """
         Get the last checkpoint listed in output directory
 
@@ -303,9 +316,12 @@ class BaseTrainer:
         checkpoint_folder_pattern = f"{PREFIX_CHECKPOINT_DIR}-[0-9]*"
         checkpoint_folders = glob.glob(os.path.join(self.output_dir, checkpoint_folder_pattern))
         checkpoint_folders = [f for f in checkpoint_folders if os.path.isdir(f)]
-        last_checkpoint_folder = sorted(checkpoint_folders, key=lambda x: int(re.findall(r"\d+", x)[-1]))[-1]
-        logger.debug("Find last checkpoint: %s", last_checkpoint_folder)
-        return last_checkpoint_folder
+        if checkpoint_folders:
+            last_checkpoint_folder = sorted(checkpoint_folders, key=lambda x: int(re.findall(r"\d+", x)[-1]))[-1]
+            logger.debug("Found the last checkpoint at: %s.", last_checkpoint_folder)
+            return last_checkpoint_folder
+        else:
+            logger.debug("No previous checkpoint found in the output directory.")
 
     @staticmethod
     def build_loader(datasets: Dict[str, data.Dataset], cfg: DataLoaderConfig):
@@ -342,30 +358,30 @@ class BaseTrainer:
         timer.end()
         return loader_and_sampler
 
-    def _wrap_model(self, model: nn.Module, is_training: bool = True):
+    def _wrap_model(self, model: nn.Module, training: bool = True):
         cfg = self.training_strategy_cfg
 
         # Move to GPU
-        if cfg.strategy in (TrainingStrategy.DDP, TrainingStrategy.FSDP):
+        if cfg.strategy in (TrainingStrategy.ddp, TrainingStrategy.fsdp):
             logger.debug("Moving model to device: %s...", torch.cuda.current_device())
             model.cuda()
 
         # Do not wrap model if not training
-        if not is_training:
+        if not training:
             logger.debug("Not training, return unwrapped model.")
             return model
 
         # wrap model
         logger.debug("Applying training strategy...")
-        if cfg.strategy in (TrainingStrategy.DDP, TrainingStrategy.FSDP):
+        if cfg.strategy in (TrainingStrategy.ddp, TrainingStrategy.fsdp):
             logger.debug("Model is moved to device: %s", torch.cuda.current_device())
-            if cfg.strategy == TrainingStrategy.DDP:
+            if cfg.strategy == TrainingStrategy.ddp:
                 logger.debug("Building DistributedDataParallel, check whether the program is hanging...")
                 model = nn.parallel.DistributedDataParallel(
                     model,
                     find_unused_parameters=cfg.ddp_find_unused_parameters
                 )
-            elif cfg.strategy == TrainingStrategy.FSDP:
+            elif cfg.strategy == TrainingStrategy.fsdp:
                 logger.debug("Building FullyShardedDataParallel, check whether the program is hanging...")
 
                 # From Hugging Face Trainer
@@ -390,7 +406,7 @@ class BaseTrainer:
                 )
             else:
                 raise RuntimeError(f"Training strategy '{cfg.strategy}' is not supported!")
-        elif cfg.strategy == TrainingStrategy.CPU:
+        elif cfg.strategy == TrainingStrategy.cpu:
             pass
         else:
             raise RuntimeError(f"Training strategy '{cfg.strategy}' is not supported!")
@@ -401,11 +417,11 @@ class BaseTrainer:
         """
         Wraps the given dataloader with `CudaPreFetcher` to prefetch tensors to GPU.
 
-        This transformation is only applied when the training strategy is either DDP or FSDP.
+        This transformation is only applied when the training strategy is either ddp or FSDP.
         Otherwise, the dataloader remains unchanged.
 
         """
-        if self.training_strategy_cfg.strategy in (TrainingStrategy.DDP, TrainingStrategy.FSDP):
+        if self.training_strategy_cfg.strategy in (TrainingStrategy.ddp, TrainingStrategy.fsdp):
             logger.debug("Building CudaPreFetcher...")
             dataloader = CudaPreFetcher(dataloader)
             logger.debug("CudaPreFetcher is built successfully.")
@@ -435,6 +451,16 @@ class BaseTrainer:
             logger.info(f"Resume model parameters from {self.resume}.")
             load_model(self.resume, self.model_wrapped, strict=False)
 
+        # Resume from last checkpoint
+        if self.cfg.resume_from_checkpoint:
+            checkpoint_folder = self._get_last_checkpoint()
+            if checkpoint_folder is not None:
+                logger.info("Resuming from the last checkpoint: %s", checkpoint_folder)
+                self._load_checkpoint(checkpoint_folder)
+            else:
+                logger.warning("`resume_from_checkpoint` is enabled, "
+                               "but no checkpoint is found in the output directory.")
+
         self.writer = get_writer(os.path.join(self.output_dir, "tensorboard"), purge_step=self.global_step)
 
     def _on_train(self):
@@ -462,14 +488,14 @@ class BaseTrainer:
                 break
 
     def _after_train(self):
-        self._barrier()
+        barrier()
         state_dict = self.model_wrapped.state_dict()
         if self.should_write:
             self.save_model(state_dict=state_dict)
 
     def _before_train_epoch(self):
         torch.cuda.empty_cache()
-        self._barrier(debug_msg="training loop")
+        barrier(debug_msg="training loop")
         if "train_sampler" in self.dataloader:
             logger.debug(f"set train sampler step to {self.epoch}")
             self.dataloader["train_sampler"].set_epoch(self.epoch)
@@ -526,7 +552,7 @@ class BaseTrainer:
                     if self.enable_amp:
                         self.scaler.unscale_(self.optimizer)
 
-                    if self.training_strategy_cfg.strategy == TrainingStrategy.FSDP:
+                    if self.training_strategy_cfg.strategy == TrainingStrategy.fsdp:
                         model.clip_grad_norm_(self.clip_norm)
                     else:
                         nn.utils.clip_grad_norm_(model.parameters(), self.clip_norm)
@@ -609,7 +635,7 @@ class BaseTrainer:
 
     def _before_test_epoch(self):
         torch.cuda.empty_cache()
-        self._barrier(debug_msg="test epoch")
+        barrier(debug_msg="test epoch")
         if "test_sampler" in self.dataloader:
             logger.debug(f"set test sampler step to {self.epoch}")
             self.dataloader["test_sampler"].set_epoch(self.epoch)
@@ -637,22 +663,14 @@ class BaseTrainer:
         self.meter.reset()
         torch.cuda.empty_cache()
 
-    def train(self):
-        if self.cfg.do_train or self.cfg.do_test:
-            self._before_train()
-            self._on_train()
-            self._after_train()
-
-    def eval(self):
-        if self.cfg.do_eval:
-            self._on_eval()
-
-    def _on_eval(self):
-        self._barrier(debug_msg="evaluation")
+    def _before_eval(self):
+        torch.cuda.empty_cache()
+        barrier(debug_msg="evaluation")
         if "eval_sampler" in self.dataloader:
             logger.debug(f"Set eval sampler step to 0")
             self.dataloader["eval_sampler"].set_epoch(0)
 
+    def _on_eval(self):
         model = self.model_wrapped
         dataloader = self._prefetch_to_gpu(self.dataloader["eval"])
 
@@ -668,8 +686,21 @@ class BaseTrainer:
             )
             process_bar.update()
 
+    def _after_eval(self):
         self.meter.summary(writer=self.writer, main_tag="eval", global_step=self.epoch)
         self.meter.reset()
+
+    def train(self):
+        if self.cfg.do_train or self.cfg.do_test:
+            self._before_train()
+            self._on_train()
+            self._after_train()
+
+    def eval(self):
+        if self.cfg.do_eval:
+            self._before_eval()
+            self._on_eval()
+            self._after_eval()
 
     @torch.no_grad()
     def _write_histogram(self):
@@ -714,16 +745,18 @@ class BaseTrainer:
             for k in sorted(loss_meta.keys()):
                 dist.all_reduce(loss_meta[k])
                 loss_meta[k] /= dist.get_world_size()
-        logger.debug(f"Step: {self.global_step} | Loss: {loss.cpu().detach().numpy()}")
+
         self.writer.add_scalar("train/loss", loss, global_step=self.global_step)
         if isinstance(loss_meta, dict):
             self.writer.add_scalars("train/loss_meta", loss_meta, global_step=self.global_step)
-        self.writer.add_scalars(
-            "train/lr",
-            {
-                f"param_group_{i}": group["lr"] if self.scheduler is None else group
-                for i, group in enumerate(self.optimizer.param_groups if self.scheduler is None
-                                          else self.scheduler.get_last_lr())
-            },
-            global_step=self.global_step
+
+        learning_rate = [group["lr"] if self.scheduler is None else group for group in
+                         (self.optimizer.param_groups if self.scheduler is None else self.scheduler.get_last_lr())]
+        self.writer.add_scalars("train/lr", {f"param_group_{i}": lr for i, lr in enumerate(learning_rate)},
+                                global_step=self.global_step)
+
+        logger.debug(
+            f"Step: %s | Loss: %s | Learning rate: %s",
+            self.global_step, loss.cpu().detach().numpy(),
+            learning_rate[0] if len(learning_rate) == 1 else learning_rate
         )
