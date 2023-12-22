@@ -158,8 +158,9 @@ def get_trainable_parameters(model: torch.nn.Module):
     Returns the number of trainable parameters and number of all parameters in the model.
     """
     trainable_params = 0
+    trainable_params_names = []
     all_param = 0
-    for _, param in model.named_parameters():
+    for param_name, param in model.named_parameters():
         num_params = param.numel()
         # if using DS Zero 3 and the weights are initialized empty
         if num_params == 0 and hasattr(param, "ds_numel"):
@@ -174,8 +175,9 @@ def get_trainable_parameters(model: torch.nn.Module):
         all_param += num_params
         if param.requires_grad:
             trainable_params += num_params
+            trainable_params_names.append(param_name)
 
-    return trainable_params, all_param
+    return trainable_params, all_param, trainable_params_names
 
 
 def compute_total_gradient_norm(model: nn.Module):
@@ -186,3 +188,23 @@ def compute_total_gradient_norm(model: nn.Module):
         total_norm += param_norm.item() ** 2
     total_norm = total_norm ** 0.5
     return total_norm
+
+
+def get_module_class_from_name(module, name):
+    """
+    Gets a class from a module by its name.
+
+    Args:
+        module (`torch.nn.Module`): The module to get the class from.
+        name (`str`): The name of the class.
+    """
+    modules_children = list(module.children())
+    if module.__class__.__name__ == name:
+        return module.__class__
+    elif len(modules_children) == 0:
+        return
+    else:
+        for child_module in modules_children:
+            module_class = get_module_class_from_name(child_module, name)
+            if module_class is not None:
+                return module_class

@@ -35,8 +35,6 @@ class Runner:
     cfg: BaseConfig
     dataset: Dict[str, data.Dataset]
     model: nn.Module
-    optimizer: optim.Optimizer
-    scheduler: Optional[optim.lr_scheduler.LRScheduler]
     meter: Meter
     trainer: BaseTrainer
 
@@ -48,8 +46,6 @@ class Runner:
         self.cfg = cfg
         self.build_dataset(cfg.dataset)
         self.build_model(cfg.model)
-        self.build_optimizer(cfg.optimizer)
-        self.build_scheduler(cfg.scheduler)
         self.build_meter(cfg.meter)
         self.build_trainer(cfg.trainer)
 
@@ -61,16 +57,6 @@ class Runner:
         with Timer("Building model from the configuration..."):
             self.model = instantiate(model_builder_config)
 
-    def build_optimizer(self, optimizer_config: DictConfig):
-        self.optimizer = instantiate(optimizer_config, _partial_=True)(params=self.model.parameters())
-
-    def build_scheduler(self, scheduler_config: DictConfig):
-        scheduler_callable = instantiate(scheduler_config, _partial_=True)
-        if scheduler_callable is not None:
-            self.scheduler = scheduler_callable(optimizer=self.optimizer)
-        else:
-            self.scheduler = None
-
     def build_meter(self, meter_config: DictConfig):
         self.meter: Meter = instantiate(meter_config)
         if self.meter is None:
@@ -79,10 +65,7 @@ class Runner:
 
     def build_trainer(self, trainer_config: BaseTrainerConfig):
         self.trainer = instantiate(trainer_config, _partial_=True)(
-            datasets=self.dataset,
-            model=self.model,
-            optimizer=self.optimizer,
-            scheduler=self.scheduler,
+            datasets=self.dataset, model=self.model,
             meter=self.meter
         )
 

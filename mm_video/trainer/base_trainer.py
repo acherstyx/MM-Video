@@ -32,9 +32,12 @@ from functools import partial
 
 from mm_video.config.registry import register_trainer_config
 from mm_video.modeling.meter import Meter
-from mm_video.utils.train_utils import CudaPreFetcher, get_trainable_parameters, compute_total_gradient_norm
-from mm_video.utils.checkpoint import auto_resume, load_model, save_model, \
-    unwrap_model
+from mm_video.utils.train_utils import (
+    CudaPreFetcher, get_trainable_parameters, compute_total_gradient_norm, get_module_class_from_name
+)
+from mm_video.utils.checkpoint import (
+    auto_resume, load_model, unwrap_model
+)
 from mm_video.utils.writer import get_writer
 from mm_video.utils.profile import Timer
 
@@ -95,24 +98,56 @@ class ModelBuilderConfig:
     fsdp_transformer_layer_cls_to_wrap: Optional[List[str]] = None
 
 
-def get_module_class_from_name(module, name):
-    """
-    Gets a class from a module by its name.
+@dataclass
+class TrainingConfig:
+    do_train: bool = False
+    do_test: bool = False
+    do_eval: bool = False  # TODO: Not implemented yet.
 
-    Args:
-        module (`torch.nn.Module`): The module to get the class from.
-        name (`str`): The name of the class.
-    """
-    modules_children = list(module.children())
-    if module.__class__.__name__ == name:
-        return module.__class__
-    elif len(modules_children) == 0:
-        return
-    else:
-        for child_module in modules_children:
-            module_class = get_module_class_from_name(child_module, name)
-            if module_class is not None:
-                return module_class
+    epoch: int = 5
+
+    amp: bool = False
+
+    clip_norm: Optional[float] = None
+
+    # Resume model from pretrained parameters
+    resume: Optional[str] = None
+    # Resume from checkpoint saved during training, including the status of optimizer, scheduler, etc.
+    auto_resume: bool = False
+
+    detect_anomaly: bool = False
+
+    # Enable/disable PyTorch profiler
+    write_profiler: bool = False
+    # How often to write training loss, loss metadata, and learning rate to TensorBoard.
+    # Set to `None` to disable.
+    write_loss_and_learning_rate: Optional[int] = 1
+    # How often to write parameter histograms to TensorBoard. Set to `None` to disable.
+    write_histogram: Optional[int] = None
+    # How often to compute and write total gradient norm to TensorBoard. Set to `None` to disable.
+    write_gradient_norm: Optional[int] = None
+
+    output_dir: str = "${hydra:runtime.output_dir}"
+    save_freq: int = 1
+
+    debug: bool = False
+
+    # Optimizer and Scheduler options
+    learning_rate: float = 1e-5
+    warmup_ratio: float = 0.0
+
+    gradient_accumulation_steps: int = 1
+
+
+@register_trainer_config(name=f"BaseTrainer")
+@dataclass
+class BaseTrainerConfig:
+    _target_: str = f"{__name__}.BaseTrainer"
+
+    data_loader: DataLoaderConfig = field(default_factory=DataLoaderConfig)
+    model_builder: ModelBuilderConfig = field(default_factory=ModelBuilderConfig)
+
+    training_config: TrainingConfig = field(default_factory=TrainingConfig)
 
 
 class BaseTrainer:
@@ -127,67 +162,73 @@ class BaseTrainer:
 
     def __init__(
             self,
-            datasets: Dict[str, data.Dataset], model: nn.Module, optimizer, scheduler, meter,
-            data_loader, model_builder,
-            test_enable: bool,
-            train_enable: bool,
-            epoch: int,
-            gradient_accumulation_steps: int,
-            resume: Optional[str],
-            auto_resume: bool,
-            clip_norm: Optional[float],
-            save_freq: int,
-            amp: bool,
-            debug: bool,
-            write_profiler: bool,
-            write_loss_and_learning_rate: int,
-            write_histogram: Optional[int],
-            write_gradient_norm: Optional[int],
-            detect_anomaly: bool,
-            output_dir: str,
+            datasets: Dict[str, data.Dataset], model: nn.Module, meter,
+            data_loader, model_builder, training_config: TrainingConfig,
+            optimizer: Optional[optim.Optimizer] = None,
+            scheduler: Optional[optim.lr_scheduler.LRScheduler] = None
     ):
-        assert write_histogram is None or not amp, \
+        cfg = training_config
+        self.cfg = cfg
+
+        assert cfg.write_histogram is None or not cfg.amp, \
             "If using AMP, `write_histogram_freq` cannot be enabled and must be set to `None`."
 
         self.model_builder_config = model_builder
 
         self.dataset = datasets
         self.dataloader = self.build_loader(datasets, cfg=data_loader)
-        self.model = self._wrap_model(model)
+        self.model_wrapped = self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.meter = meter
 
-        torch.autograd.set_detect_anomaly(detect_anomaly)
+        torch.autograd.set_detect_anomaly(cfg.detect_anomaly)
 
-        self.train_enable = train_enable
-        self.test_enable = test_enable
+        self.do_train = cfg.do_train
+        self.do_test = cfg.do_test
 
-        self.debug = debug
+        self.debug = cfg.debug
 
-        self.resume = resume
-        self.auto_resume = auto_resume
-        self.output_dir = output_dir
-        self.save_freq = save_freq
+        self.resume = cfg.resume
+        self.auto_resume = cfg.auto_resume
+        self.output_dir = cfg.output_dir
+        self.save_freq = cfg.save_freq
 
         def get_write_freq(x: Optional[int]):
             assert x is None or type(x) is int
             return float("inf") if x is None else x
 
-        self.write_profiler = write_profiler
-        self.write_loss_and_learning_rate_freq = get_write_freq(write_loss_and_learning_rate)
-        self.write_histogram_freq = get_write_freq(write_histogram)
-        self.write_gradient_norm_freq = get_write_freq(write_gradient_norm)
+        self.write_profiler = cfg.write_profiler
+        self.write_loss_and_learning_rate_freq = get_write_freq(cfg.write_loss_and_learning_rate)
+        self.write_histogram_freq = get_write_freq(cfg.write_histogram)
+        self.write_gradient_norm_freq = get_write_freq(cfg.write_gradient_norm)
 
-        self.enable_amp = amp
-        self.scaler: GradScaler = GradScaler() if amp else None
-        self.clip_norm = clip_norm
+        self.enable_amp = cfg.amp
+        self.scaler: GradScaler = GradScaler() if cfg.amp else None
+        self.clip_norm = cfg.clip_norm
 
-        self.epoch_total = epoch
-        self.global_step = self.epoch_start = self.epoch = 0  # Init to 0
-        self.gradient_accumulation_step = gradient_accumulation_steps
+        self.epoch_total = cfg.epoch
+        self.global_step = self.epoch = 0  # Init to 0
+
+        self.gradient_accumulation_step = cfg.gradient_accumulation_steps
+        assert self.gradient_accumulation_step >= 1
 
         self.info()
+
+    def create_optimizer(self):
+        self.optimizer = optim.AdamW(self.model_wrapped.parameters(), lr=self.cfg.learning_rate)
+
+    def create_scheduler(self, optimizer: optim.Optimizer):
+        self.scheduler = None
+
+    def get_train_dataloader(self):
+        return self.dataloader["train"]
+
+    def get_test_dataloader(self):
+        return self.dataloader["test"]
+
+    def get_eval_dataloader(self):
+        return self.dataloader["eval"]
 
     @property
     def should_write(self) -> bool:
@@ -334,7 +375,7 @@ class BaseTrainer:
                         transformer_layer_cls=transformer_cls_to_wrap
                     )
 
-                model = FullyShardedDataParallel(
+                self.model = model = FullyShardedDataParallel(
                     model,
                     cpu_offload=CPUOffload(offload_params=cfg.fsdp_offload),
                     auto_wrap_policy=auto_wrap_policy
@@ -351,16 +392,27 @@ class BaseTrainer:
     def info(self):
         """CUSTOMIZE: to print some information"""
         logger.info("Train Epoch: %d", self.epoch_total)
-        trainable_params, all_param = get_trainable_parameters(self.model)
+        trainable_params, all_param, trainable_params_names = get_trainable_parameters(self.model)
         logger.info("Trainable params: %d", trainable_params)
+        logger.debug("Trainable params: \n\t%s", '\n\t'.join(trainable_params_names))
         logger.info("All params: %d", all_param)
         logger.info("Trainable%%: %f", 100 * trainable_params / all_param)
 
     def _before_train(self):
+        # Wrap model before training
+        self.model_wrapped = self._wrap_model(self.model)
+
+        # Build optimizer if optimizer is not passed to trainer
+        if self.optimizer is None:
+            self.create_optimizer()
+        if self.scheduler is None:
+            self.create_scheduler(self.optimizer)
+
         # resume from specified model
         if self.resume is not None:
             logger.info(f"Resume model parameters from {self.resume}.")
             load_model(self.resume, self.model, strict=False)
+
         # auto resume from checkpoint
         if self.auto_resume:
             logger.info("Auto resume is enabled, recover from the most recent checkpoint.")
@@ -374,21 +426,20 @@ class BaseTrainer:
                 logger.info(f"No checkpoint was found in directory {ckpt_dir}.")
         else:
             logger.debug("Auto resume is disabled.")
-        self.global_step = self.epoch_start * (len(self.dataloader["train"]) // self.gradient_accumulation_step) \
-            if not self.debug else self.epoch_start * min(len(self.dataloader["train"]), 100)
+
         self.writer = get_writer(os.path.join(self.output_dir, "tensorboard"), purge_step=self.global_step)
 
     def _on_train(self):
-        for epoch in range(self.epoch_start, self.epoch_total):
+        for epoch in range(self.epoch, self.epoch_total):
             self.epoch = epoch
             logger.debug(f"Epoch {epoch + 1}/{self.epoch_total}")
-            if self.train_enable:
+            if self.do_train:
                 self._before_train_epoch()
                 self._on_train_epoch()
                 self._after_train_epoch()
             else:
                 logger.warning("Training is disabled!")
-            if self.test_enable:
+            if self.do_test:
                 self._before_test_epoch()
                 self._on_test_epoch()
                 self._after_test_epoch()
@@ -410,16 +461,16 @@ class BaseTrainer:
 
     def _on_train_epoch(self):
         # Get training data and model
-        dataloader = self.dataloader["train"]
-        model = self.model
+        train_dataloader = self.get_train_dataloader()
+        model = self.model_wrapped
 
         if torch.cuda.is_available():
             logger.debug("Building CudaPreFetcher...")
-            dataloader = CudaPreFetcher(dataloader)  # prefetch to GPU
+            train_dataloader = CudaPreFetcher(train_dataloader)  # prefetch to GPU
             logger.debug("CudaPreFetcher is built successfully.")
         progress_bar = tqdm(desc=f"Train: {self.epoch + 1}/{self.epoch_total}",
                             dynamic_ncols=True,
-                            total=len(dataloader) // self.gradient_accumulation_step,
+                            total=len(train_dataloader) // self.gradient_accumulation_step,
                             disable=dist.is_initialized() and dist.get_rank() != 0)
         prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(wait=5, warmup=5, active=5, repeat=1),
@@ -435,7 +486,7 @@ class BaseTrainer:
         loss_meta_total = defaultdict(float)
 
         logger.debug("Running train epoch for-loop...")
-        for cur_step, inputs in enumerate(dataloader):
+        for cur_step, inputs in enumerate(train_dataloader):
             outputs, loss, loss_meta = self._train_step(model=model, inputs=inputs)
 
             loss_total += loss
@@ -458,19 +509,24 @@ class BaseTrainer:
                         inputs=inputs, outputs=outputs,
                         writer=self.writer, main_tag="train", global_step=self.global_step
                     )
-                # optimize
-                if not self.enable_amp:
-                    if self.clip_norm is not None:  # clip by norm
-                        nn.utils.clip_grad_norm_(model.parameters(), self.clip_norm)
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-                else:
-                    if self.clip_norm is not None:  # clip by norm
+
+                # clip by norm
+                if self.clip_norm is not None:
+                    if self.enable_amp:
                         self.scaler.unscale_(self.optimizer)
+
+                    if self.model_builder_config.parallelism == Parallelism.FSDP:
                         nn.utils.clip_grad_norm_(model.parameters(), self.clip_norm)
+                    else:
+                        model.clip_grad_norm_(self.clip_norm)
+
+                # optimize
+                if self.enable_amp:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
-                    self.optimizer.zero_grad()
+                else:
+                    self.optimizer.step()
+                self.optimizer.zero_grad()
 
                 if self.scheduler is not None:
                     self.scheduler.step()
@@ -545,8 +601,11 @@ class BaseTrainer:
 
     @torch.no_grad()
     def _on_test_epoch(self):
-        self.model.eval()
-        dataloader = self.dataloader["test"]
+        model = self.model_wrapped
+        dataloader = self.get_test_dataloader()
+
+        model.eval()
+
         progress_bar = tqdm(desc=f"Eval epoch {self.epoch + 1}", dynamic_ncols=True, total=len(dataloader),
                             disable=dist.is_initialized() and dist.get_rank() != 0)
         if torch.cuda.is_available():
@@ -630,42 +689,3 @@ class BaseTrainer:
             },
             global_step=self.global_step
         )
-
-
-@register_trainer_config(name=f"{BaseTrainer.__name__}")
-@dataclass
-class BaseTrainerConfig:
-    _target_: str = f"{__name__}.{BaseTrainer.__qualname__}"
-
-    data_loader: DataLoaderConfig = field(default_factory=DataLoaderConfig)
-    model_builder: ModelBuilderConfig = field(default_factory=ModelBuilderConfig)
-
-    # Enable/Disable train/test loop
-    train_enable: bool = True
-    test_enable: bool = True
-
-    epoch: int = 5
-    amp: bool = False
-    gradient_accumulation_steps: int = 1
-    detect_anomaly: bool = False
-    clip_norm: Optional[float] = None
-
-    # Resume model from pretrained parameters
-    resume: Optional[str] = None
-    # Resume from checkpoint saved during training, including the status of optimizer, scheduler, etc.
-    auto_resume: bool = False
-
-    # Enable/disable PyTorch profiler
-    write_profiler: bool = False
-    # How often to write training loss, loss metadata, and learning rate to TensorBoard.
-    # Set to `None` to disable.
-    write_loss_and_learning_rate: Optional[int] = 1
-    # How often to write parameter histograms to TensorBoard. Set to `None` to disable.
-    write_histogram: Optional[int] = None
-    # How often to compute and write total gradient norm to TensorBoard. Set to `None` to disable.
-    write_gradient_norm: Optional[int] = None
-
-    output_dir: str = "${hydra:runtime.output_dir}"
-    save_freq: int = 1
-
-    debug: bool = False
