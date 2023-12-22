@@ -3,8 +3,10 @@
 # @Author  : Yaojie Shen
 # @Project : MM-Video
 # @File    : base_trainer.py
-
+import glob
 import os
+import re
+
 from tqdm import tqdm
 import logging
 
@@ -36,12 +38,15 @@ from mm_video.utils.train_utils import (
     CudaPreFetcher, get_trainable_parameters, compute_total_gradient_norm, get_module_class_from_name, get_world_size
 )
 from mm_video.utils.checkpoint import (
-    auto_resume, load_model, unwrap_model
+    load_model, unwrap_model
 )
 from mm_video.utils.writer import get_writer
 from mm_video.utils.profile import Timer
 
-__all__ = ["BaseTrainer", "BaseTrainerConfig"]
+__all__ = [
+    "BaseTrainer", "BaseTrainerConfig",
+    "TrainingStrategy", "TrainingStrategyConfig", "DataLoaderConfig", "TrainingConfig"
+]
 
 logger = logging.getLogger(__name__)
 
@@ -114,8 +119,6 @@ class TrainingConfig:
 
     # Resume model from pretrained parameters
     resume: Optional[str] = None
-    # Resume from checkpoint saved during training, including the status of optimizer, scheduler, etc.
-    auto_resume: bool = False
 
     detect_anomaly: bool = False
 
@@ -137,6 +140,7 @@ class TrainingConfig:
     # Optimizer and Scheduler options
     learning_rate: float = 1e-5
     warmup_ratio: float = 0.0
+    warmup_steps: int = 0
 
     gradient_accumulation_steps: int = 1
 
@@ -145,6 +149,7 @@ class TrainingConfig:
 @dataclass
 class BaseTrainerConfig:
     _target_: str = f"{__name__}.BaseTrainer"
+    _partial_: bool = True
 
     training_config: TrainingConfig = field(default_factory=TrainingConfig)
     dataloader_config: DataLoaderConfig = field(default_factory=DataLoaderConfig)
@@ -169,17 +174,17 @@ class BaseTrainer:
         assert cfg.write_histogram is None or not cfg.amp, \
             "If using AMP, `write_histogram_freq` cannot be enabled and must be set to `None`."
 
+        torch.autograd.set_detect_anomaly(cfg.detect_anomaly)
+
         self.dataset = datasets
         self.dataloader = self.build_loader(datasets, cfg=dataloader_config)
+
         self.model_wrapped = self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.meter = meter
 
-        torch.autograd.set_detect_anomaly(cfg.detect_anomaly)
-
         self.resume = cfg.resume
-        self.auto_resume = cfg.auto_resume
         self.output_dir = cfg.output_dir
         self.save_freq = cfg.save_freq
 
@@ -207,16 +212,7 @@ class BaseTrainer:
         self.optimizer = optim.AdamW(self.model_wrapped.parameters(), lr=self.cfg.learning_rate)
 
     def create_scheduler(self, optimizer: optim.Optimizer):
-        self.scheduler = None
-
-    def get_train_dataloader(self):
-        return self.dataloader["train"]
-
-    def get_test_dataloader(self):
-        return self.dataloader["test"]
-
-    def get_eval_dataloader(self):
-        return self.dataloader["eval"]
+        self.scheduler = None  # TODO: Support warmup scheduler
 
     @property
     def should_write(self) -> bool:
@@ -252,13 +248,17 @@ class BaseTrainer:
             torch.save(state_dict, model_file)
 
     def _save_checkpoint(self):
+        """
+        Save current training status to checkpoint
+
+        """
         checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.global_step}"
         output_dir = os.path.join(self.output_dir, checkpoint_folder)
         logger.debug("Saving trainer checkpoint to %s", output_dir)
         os.makedirs(output_dir, exist_ok=True)
 
         # Save model status
-        state_dict = self.model.state_dict()
+        state_dict = self.model_wrapped.state_dict()
         if self.should_write:
             self.save_model(output_dir=output_dir, state_dict=state_dict)
 
@@ -273,12 +273,15 @@ class BaseTrainer:
         logger.debug("Checkpoint is saved successfully.")
 
     def _load_checkpoint(self, checkpoint: str):
+        """
+        Resume saved training status from checkpoint
+
+        """
         logger.info("Loading checkpoint from %s", checkpoint)
 
         # Load model states
         model_state_dict = torch.load(os.path.join(checkpoint, MODEL_NAME_BIN), map_location="cpu")
-        model = unwrap_model(self.model)
-        model.load_state_dict(model_state_dict)
+        self.model_wrapped.load_state_dict(model_state_dict)
 
         # Load optimizer
         optimizer_file = os.path.join(checkpoint, OPTIMIZER_NAME_BIN)
@@ -291,6 +294,18 @@ class BaseTrainer:
             self.scheduler.load_state_dict(torch.load(scheduler_file, map_location="cpu"))
 
         logger.info("Checkpoint is loaded successfully.")
+
+    def _get_last_checkpoint(self) -> str:
+        """
+        Get the last checkpoint listed in output directory
+
+        """
+        checkpoint_folder_pattern = f"{PREFIX_CHECKPOINT_DIR}-[0-9]*"
+        checkpoint_folders = glob.glob(os.path.join(self.output_dir, checkpoint_folder_pattern))
+        checkpoint_folders = [f for f in checkpoint_folders if os.path.isdir(f)]
+        last_checkpoint_folder = sorted(checkpoint_folders, key=lambda x: int(re.findall(r"\d+", x)[-1]))[-1]
+        logger.debug("Find last checkpoint: %s", last_checkpoint_folder)
+        return last_checkpoint_folder
 
     @staticmethod
     def build_loader(datasets: Dict[str, data.Dataset], cfg: DataLoaderConfig):
@@ -382,6 +397,20 @@ class BaseTrainer:
         logger.debug("Model is wrapped successfully.")
         return model
 
+    def _prefetch_to_gpu(self, dataloader: data.DataLoader) -> data.DataLoader:
+        """
+        Wraps the given dataloader with `CudaPreFetcher` to prefetch tensors to GPU.
+
+        This transformation is only applied when the training strategy is either DDP or FSDP.
+        Otherwise, the dataloader remains unchanged.
+
+        """
+        if self.training_strategy_cfg.strategy in (TrainingStrategy.DDP, TrainingStrategy.FSDP):
+            logger.debug("Building CudaPreFetcher...")
+            dataloader = CudaPreFetcher(dataloader)
+            logger.debug("CudaPreFetcher is built successfully.")
+        return dataloader
+
     def info(self):
         """CUSTOMIZE: to print some information"""
         logger.info("Train Epoch: %d", self.epoch_total)
@@ -395,30 +424,16 @@ class BaseTrainer:
         # Wrap model before training
         self.model_wrapped = self._wrap_model(self.model)
 
-        # Build optimizer if optimizer is not passed to trainer
+        # Build optimizer and scheduler before training if is not passed to trainer
         if self.optimizer is None:
             self.create_optimizer()
         if self.scheduler is None:
             self.create_scheduler(self.optimizer)
 
-        # resume from specified model
+        # Resume from specified model, use for load pretrained weight
         if self.resume is not None:
             logger.info(f"Resume model parameters from {self.resume}.")
-            load_model(self.resume, self.model, strict=False)
-
-        # auto resume from checkpoint
-        if self.auto_resume:
-            logger.info("Auto resume is enabled, recover from the most recent checkpoint.")
-            ckpt_dir = os.path.join(self.output_dir, "checkpoint")
-            ckpt_file = auto_resume(ckpt_dir)
-            if ckpt_file is not None:
-                logger.info(f"auto resume from checkpoint: {ckpt_file}")
-                # resume from checkpoint
-                self._load_checkpoint(checkpoint=ckpt_file)
-            else:
-                logger.info(f"No checkpoint was found in directory {ckpt_dir}.")
-        else:
-            logger.debug("Auto resume is disabled.")
+            load_model(self.resume, self.model_wrapped, strict=False)
 
         self.writer = get_writer(os.path.join(self.output_dir, "tensorboard"), purge_step=self.global_step)
 
@@ -426,22 +441,29 @@ class BaseTrainer:
         for epoch in range(self.epoch, self.epoch_total):
             self.epoch = epoch
             logger.debug(f"Epoch {epoch + 1}/{self.epoch_total}")
+
             if self.cfg.do_train:
                 self._before_train_epoch()
                 self._on_train_epoch()
                 self._after_train_epoch()
             else:
-                logger.warning("Training is disabled!")
+                logger.warning("Training is disabled. Skipping training process...")
+
+            # TODO: Add an option to set test frequency
             if self.cfg.do_test:
                 self._before_test_epoch()
                 self._on_test_epoch()
                 self._after_test_epoch()
             else:
-                logger.warning("Testing is disabled!")
+                logger.info("Testing is disabled. Skipping testing process...")
+
+            # Only run test for once if training is disabled
+            if not self.cfg.do_train:
+                break
 
     def _after_train(self):
         self._barrier()
-        state_dict = self.model.state_dict()
+        state_dict = self.model_wrapped.state_dict()
         if self.should_write:
             self.save_model(state_dict=state_dict)
 
@@ -453,24 +475,20 @@ class BaseTrainer:
             self.dataloader["train_sampler"].set_epoch(self.epoch)
 
     def _on_train_epoch(self):
-        # Get training data and model
-        train_dataloader = self.get_train_dataloader()
+        train_dataloader = self._prefetch_to_gpu(self.dataloader["train"])
         model = self.model_wrapped
 
-        if torch.cuda.is_available():
-            logger.debug("Building CudaPreFetcher...")
-            train_dataloader = CudaPreFetcher(train_dataloader)  # prefetch to GPU
-            logger.debug("CudaPreFetcher is built successfully.")
         progress_bar = tqdm(desc=f"Train: {self.epoch + 1}/{self.epoch_total}",
                             dynamic_ncols=True,
                             total=len(train_dataloader) // self.gradient_accumulation_step,
                             disable=dist.is_initialized() and dist.get_rank() != 0)
+
         prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(wait=5, warmup=5, active=5, repeat=1),
             on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join(self.output_dir, "profiler")),
             record_shapes=False,
             with_stack=False
-        )
+        ) if self.cfg.write_profiler else None
         if self.cfg.write_profiler:
             logger.warning("Torch profiler is enabled, performance may be impacted.")
             prof.start()
@@ -503,17 +521,17 @@ class BaseTrainer:
                         writer=self.writer, main_tag="train", global_step=self.global_step
                     )
 
-                # clip by norm
+                # Clip by norm
                 if self.clip_norm is not None:
                     if self.enable_amp:
                         self.scaler.unscale_(self.optimizer)
 
                     if self.training_strategy_cfg.strategy == TrainingStrategy.FSDP:
-                        nn.utils.clip_grad_norm_(model.parameters(), self.clip_norm)
-                    else:
                         model.clip_grad_norm_(self.clip_norm)
+                    else:
+                        nn.utils.clip_grad_norm_(model.parameters(), self.clip_norm)
 
-                # optimize
+                # Optimize
                 if self.enable_amp:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
@@ -529,10 +547,14 @@ class BaseTrainer:
                 progress_bar.update()
                 if self.cfg.write_profiler:
                     prof.step()
+
+            # Exit if debug
             if self.cfg.debug and cur_step + 1 >= 100 * self.gradient_accumulation_step:
                 logger.warning("Debug mode is enabled, only run for 100 step.")
                 break
+
         logger.debug("Train epoch for-loop finished.")
+
         if self.cfg.write_profiler:
             prof.stop()
 
@@ -595,15 +617,13 @@ class BaseTrainer:
     @torch.no_grad()
     def _on_test_epoch(self):
         model = self.model_wrapped
-        dataloader = self.get_test_dataloader()
-
-        model.eval()
+        dataloader = self._prefetch_to_gpu(self.dataloader["test"])
 
         progress_bar = tqdm(desc=f"Eval epoch {self.epoch + 1}", dynamic_ncols=True, total=len(dataloader),
                             disable=dist.is_initialized() and dist.get_rank() != 0)
-        if torch.cuda.is_available():
-            dataloader = CudaPreFetcher(dataloader)  # move to GPU
+
         for inputs in dataloader:
+            model.eval()
             outputs = self.model(inputs)
             self.meter.update(
                 inputs=inputs, outputs=outputs,
@@ -618,13 +638,14 @@ class BaseTrainer:
         torch.cuda.empty_cache()
 
     def train(self):
-        self._before_train()
-        self._on_train()
-        self._after_train()
+        if self.cfg.do_train or self.cfg.do_test:
+            self._before_train()
+            self._on_train()
+            self._after_train()
 
     def eval(self):
-        # TODO: Add evaluation
-        pass
+        if self.cfg.do_eval:
+            pass
 
     @torch.no_grad()
     def _write_histogram(self):

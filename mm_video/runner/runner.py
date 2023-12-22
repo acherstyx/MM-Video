@@ -64,13 +64,14 @@ class Runner:
             self.meter = DummyMeter()
 
     def build_trainer(self, trainer_config: BaseTrainerConfig):
-        self.trainer = instantiate(trainer_config, _partial_=True)(
+        self.trainer = instantiate(trainer_config)(
             datasets=self.dataset, model=self.model,
             meter=self.meter
         )
 
     def run(self):
         self.trainer.train()
+        self.trainer.eval()
 
 
 @register_runner_config(name=f"{Runner.__qualname__}")
@@ -82,7 +83,7 @@ class RunnerConfig:
 @hydra.main(version_base=None, config_name="config",
             config_path=f"{os.path.dirname(os.path.abspath(__file__))}/../../configs")
 def main(cfg: BaseConfig):
-    print(f"{get_timestamp()} => Run trainer")
+    print(f"{get_timestamp()} => Execution started.")
     runner = instantiate(cfg.runner, _partial_=True)(cfg)
     runner.run()
-    print(f"{get_timestamp()} => Finished!")
+    print(f"{get_timestamp()} => Execution finished.")

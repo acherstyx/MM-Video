@@ -13,11 +13,8 @@ from typing import Dict
 
 
 class ModelStates:
-    def __init__(self, model_file: str, is_checkpoint: bool = False, no_confirm: bool = False):
+    def __init__(self, model_file: str, no_confirm: bool = False):
         state_dict = torch.load(model_file, map_location="cpu")
-        if is_checkpoint:
-            assert isinstance(state_dict, dict) and "model" in state_dict.keys()
-            state_dict = state_dict["model"]
         self.history = []
         self.state_dict: Dict[str, torch.Tensor] = state_dict
         self.no_confirm: bool = no_confirm

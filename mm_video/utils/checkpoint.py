@@ -28,24 +28,11 @@ def unwrap_model(model: nn.Module) -> nn.Module:
         return model
 
 
-def auto_resume(ckpt_folder: str):
-    try:
-        ckpt_files = [ckpt for ckpt in os.listdir(ckpt_folder) if ckpt.endswith(".pth")]
-    except FileNotFoundError:
-        ckpt_files = []
-    if len(ckpt_files) > 0:
-        return max([os.path.join(ckpt_folder, file) for file in ckpt_files], key=os.path.getmtime)
-    else:
-        return None
-
-
 def save_model(model_file: str, model: torch.nn.Module):
-    model = unwrap_model(model)
     torch.save(model.state_dict(), model_file)
 
 
 def load_model(model_file: str, model: torch.nn.Module, strict=True):
-    model = unwrap_model(model)
     state_dict = torch.load(model_file, map_location="cpu")
 
     missing_keys: List[str] = []
