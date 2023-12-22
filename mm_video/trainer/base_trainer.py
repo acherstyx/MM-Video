@@ -619,8 +619,8 @@ class BaseTrainer:
         model = self.model_wrapped
         dataloader = self._prefetch_to_gpu(self.dataloader["test"])
 
-        progress_bar = tqdm(desc=f"Eval epoch {self.epoch + 1}", dynamic_ncols=True, total=len(dataloader),
-                            disable=dist.is_initialized() and dist.get_rank() != 0)
+        progress_bar = tqdm(desc=f"Test on epoch {self.epoch + 1}", dynamic_ncols=True, total=len(dataloader),
+                            disable=not self.should_write)
 
         for inputs in dataloader:
             model.eval()
@@ -645,7 +645,31 @@ class BaseTrainer:
 
     def eval(self):
         if self.cfg.do_eval:
-            pass
+            self._on_eval()
+
+    def _on_eval(self):
+        self._barrier(debug_msg="evaluation")
+        if "eval_sampler" in self.dataloader:
+            logger.debug(f"Set eval sampler step to 0")
+            self.dataloader["eval_sampler"].set_epoch(0)
+
+        model = self.model_wrapped
+        dataloader = self._prefetch_to_gpu(self.dataloader["eval"])
+
+        process_bar = tqdm(desc="Evaluation", dynamic_ncols=True, total=len(dataloader),
+                           disable=not self.should_write)
+
+        for inputs in dataloader:
+            model.eval()
+            outputs = self.model(inputs)
+            self.meter.update(
+                inputs=inputs, outputs=outputs,
+                writer=self.writer, main_tag="eval", global_step=self.epoch
+            )
+            process_bar.update()
+
+        self.meter.summary(writer=self.writer, main_tag="eval", global_step=self.epoch)
+        self.meter.reset()
 
     @torch.no_grad()
     def _write_histogram(self):
