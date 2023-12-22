@@ -74,7 +74,7 @@ class ModelStates:
             self.state_dict = self.history[0]
             self.history = []
         else:
-            print("No changes is made to the state dict.`")
+            print("No changes is made to the state dict.")
         return self
 
 

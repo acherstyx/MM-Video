@@ -33,13 +33,23 @@ from functools import partial
 from mm_video.config.registry import register_trainer_config
 from mm_video.modeling.meter import Meter
 from mm_video.utils.train_utils import CudaPreFetcher, get_trainable_parameters, compute_total_gradient_norm
-from mm_video.utils.checkpoint import save_checkpoint, load_checkpoint, auto_resume, load_model, save_model
+from mm_video.utils.checkpoint import auto_resume, load_model, save_model, \
+    unwrap_model
 from mm_video.utils.writer import get_writer
 from mm_video.utils.profile import Timer
 
 __all__ = ["BaseTrainer", "BaseTrainerConfig"]
 
 logger = logging.getLogger(__name__)
+
+PREFIX_CHECKPOINT_DIR = "checkpoint"
+
+MODEL_NAME = "pytorch_model"
+OPTIMIZER_NAME = "optimizer"
+SCHEDULER_NAME = "scheduler"
+MODEL_NAME_BIN = f"{MODEL_NAME}.bin"
+OPTIMIZER_NAME_BIN = f"{OPTIMIZER_NAME}.bin"
+SCHEDULER_NAME_BIN = f"{SCHEDULER_NAME}.bin"
 
 
 @dataclass
@@ -174,10 +184,84 @@ class BaseTrainer:
         self.clip_norm = clip_norm
 
         self.epoch_total = epoch
-        self.global_step = self.epoch_start = self.epoch = 0
+        self.global_step = self.epoch_start = self.epoch = 0  # Init to 0
         self.gradient_accumulation_step = gradient_accumulation_steps
 
         self.info()
+
+    @property
+    def should_write(self) -> bool:
+        return not dist.is_initialized() or dist.get_rank() == 0
+
+    @staticmethod
+    def _barrier(debug_msg: Optional[str] = None):
+        if dist.is_initialized():
+            if debug_msg is not None:
+                logger.debug("Reached the '%s' barrier, waiting for other processes.", debug_msg)
+            dist.barrier()
+            if debug_msg is not None:
+                logger.debug("Exited the '%s' barrier.", debug_msg)
+
+    def save_model(self, output_dir: Optional[str] = None, state_dict: Optional[Any] = None):
+        """
+        Save model (state dict) to disk. Make sure this function is only executed on process 0.
+
+        @param output_dir:
+        @param state_dict:
+        """
+        output_dir = output_dir if output_dir is not None else self.output_dir
+        model_file = os.path.join(output_dir, MODEL_NAME_BIN)
+        logger.info(f"Saving model to {model_file}")
+
+        if state_dict is None:
+            # Call the state_dict on each rank before saving on rank 0, required by FSDP model
+            model = unwrap_model(self.model)
+            state_dict = model.state_dict()
+
+        if self.should_write:
+            os.makedirs(output_dir, exist_ok=True)
+            torch.save(state_dict, model_file)
+
+    def _save_checkpoint(self):
+        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.global_step}"
+        output_dir = os.path.join(self.output_dir, checkpoint_folder)
+        logger.debug("Saving trainer checkpoint to %s", output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Save model status
+        state_dict = self.model.state_dict()
+        if self.should_write:
+            self.save_model(output_dir=output_dir, state_dict=state_dict)
+
+        # Save optimizer
+        if self.should_write:
+            torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME_BIN))
+
+        # Save scheduler
+        if self.should_write and self.scheduler is not None:
+            torch.save(self.scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME_BIN))
+
+        logger.debug("Checkpoint is saved successfully.")
+
+    def _load_checkpoint(self, checkpoint: str):
+        logger.info("Loading checkpoint from %s", checkpoint)
+
+        # Load model states
+        model_state_dict = torch.load(os.path.join(checkpoint, MODEL_NAME_BIN), map_location="cpu")
+        model = unwrap_model(self.model)
+        model.load_state_dict(model_state_dict)
+
+        # Load optimizer
+        optimizer_file = os.path.join(checkpoint, OPTIMIZER_NAME_BIN)
+        if os.path.exists(optimizer_file):
+            self.optimizer.load_state_dict(torch.load(optimizer_file, map_location="cpu"))
+
+        # Load scheduler
+        scheduler_file = os.path.join(checkpoint, SCHEDULER_NAME_BIN)
+        if os.path.exists(scheduler_file):
+            self.scheduler.load_state_dict(torch.load(scheduler_file, map_location="cpu"))
+
+        logger.info("Checkpoint is loaded successfully.")
 
     @staticmethod
     def build_loader(datasets: Dict[str, data.Dataset], cfg: DataLoaderConfig):
@@ -285,8 +369,7 @@ class BaseTrainer:
             if ckpt_file is not None:
                 logger.info(f"auto resume from checkpoint: {ckpt_file}")
                 # resume from checkpoint
-                self.epoch_start = load_checkpoint(ckpt_file, self.model, self.optimizer, self.scheduler,
-                                                   restart_train=False)
+                self._load_checkpoint(checkpoint=ckpt_file)
             else:
                 logger.info(f"No checkpoint was found in directory {ckpt_dir}.")
         else:
@@ -313,13 +396,14 @@ class BaseTrainer:
                 logger.warning("Testing is disabled!")
 
     def _after_train(self):
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            save_model(model_file=os.path.join(self.output_dir, "pytorch_model.bin"), model=self.model)
+        self._barrier()
+        state_dict = self.model.state_dict()
+        if self.should_write:
+            self.save_model(state_dict=state_dict)
 
     def _before_train_epoch(self):
         torch.cuda.empty_cache()
-        if dist.is_initialized():
-            dist.barrier()
+        self._barrier(debug_msg="training loop")
         if "train_sampler" in self.dataloader:
             logger.debug(f"set train sampler step to {self.epoch}")
             self.dataloader["train_sampler"].set_epoch(self.epoch)
@@ -448,24 +532,13 @@ class BaseTrainer:
         self.meter.summary(writer=self.writer, main_tag="train", global_step=self.global_step)
         self.meter.reset()
         # save checkpoint
-        if (self.epoch + 1) % self.save_freq == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
-            logger.debug("Saving checkpoint...")
-            checkpoint_dir = os.path.join(self.output_dir, "checkpoint")
-            save_checkpoint(ckpt_folder=checkpoint_dir,
-                            epoch=self.epoch + 1,
-                            model=self.model,
-                            optimizer=self.optimizer,
-                            scheduler=self.scheduler,
-                            config=None)
-            logger.info("Checkpoint is saved to %s", checkpoint_dir)
+        if (self.epoch + 1) % self.save_freq == 0:
+            self._save_checkpoint()
         torch.cuda.empty_cache()
 
     def _before_test_epoch(self):
         torch.cuda.empty_cache()
-        if dist.is_initialized():
-            logger.debug("Reach test epoch start barrier.")
-            dist.barrier()
-            logger.debug("Entering test loop...")
+        self._barrier(debug_msg="test epoch")
         if "test_sampler" in self.dataloader:
             logger.debug(f"set test sampler step to {self.epoch}")
             self.dataloader["test_sampler"].set_epoch(self.epoch)
