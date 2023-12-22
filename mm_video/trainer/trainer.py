@@ -39,11 +39,9 @@ from mm_video.modeling.optimization import get_linear_schedule_with_warmup
 from mm_video.utils.train_utils import (
     CudaPreFetcher, get_trainable_parameters, compute_total_gradient_norm, get_world_size
 )
-from mm_video.utils.checkpoint import load_model, unwrap_model
 from mm_video.utils.writer import get_writer
 from mm_video.utils.profile import Timer
-
-from .trainer_utils import barrier, get_module_class_from_name
+from .trainer_utils import barrier, get_module_class_from_name, load_state_dict, unwrap_model
 
 __all__ = [
     "Trainer", "TrainerConfig",
@@ -422,9 +420,10 @@ class Trainer:
 
         """
         if self.training_strategy_cfg.strategy in (TrainingStrategy.ddp, TrainingStrategy.fsdp):
-            logger.debug("Building CudaPreFetcher...")
+            logger.debug("Building CudaPreFetcher. "
+                         "This might take a moment as it waits for all Torch DataLoader workers to initialize...")
             dataloader = CudaPreFetcher(dataloader)
-            logger.debug("CudaPreFetcher is built successfully.")
+            logger.debug("CudaPreFetcher successfully built.")
         return dataloader
 
     def info(self):
@@ -440,16 +439,16 @@ class Trainer:
         # Wrap model before training
         self.model_wrapped = self._wrap_model(self.model)
 
+        # Resume from specified model, use for load pretrained weight
+        if self.resume is not None:
+            logger.info(f"Resume model parameters from {self.resume}.")
+            load_state_dict(self.model_wrapped, model_file=self.resume, strict=False)
+
         # Build optimizer and scheduler before training if is not passed to trainer
         if self.optimizer is None:
             self.create_optimizer()
         if self.scheduler is None:
             self.create_scheduler(self.optimizer)
-
-        # Resume from specified model, use for load pretrained weight
-        if self.resume is not None:
-            logger.info(f"Resume model parameters from {self.resume}.")
-            load_model(self.resume, self.model_wrapped, strict=False)
 
         # Resume from last checkpoint
         if self.cfg.resume_from_checkpoint:
