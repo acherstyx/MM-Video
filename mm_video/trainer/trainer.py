@@ -41,7 +41,7 @@ from mm_video.utils.train_utils import (
 )
 from mm_video.utils.writer import get_writer
 from mm_video.utils.profile import Timer
-from .trainer_utils import barrier, get_module_class_from_name, load_state_dict, unwrap_model
+from .trainer_utils import barrier, get_module_class_from_name, load_state_dict, unwrap_model, get_write_freq
 
 __all__ = [
     "Trainer",
@@ -99,8 +99,10 @@ class TrainingStrategy(Enum):
 class TrainingStrategyConfig:
     strategy: TrainingStrategy = TrainingStrategy.ddp if torch.cuda.is_available() else TrainingStrategy.cpu
 
+    # DDP options
     ddp_find_unused_parameters: bool = False
 
+    # FSDP options
     fsdp_offload: bool = False
     fsdp_transformer_layer_cls_to_wrap: Optional[List[str]] = None
     fsdp_sync_module_states: bool = False
@@ -110,10 +112,6 @@ class TrainingStrategyConfig:
 
 @dataclass
 class TrainingConfig:
-    do_train: bool = False
-    do_test: bool = False
-    do_eval: bool = False
-
     num_train_epochs: int = 5
 
     amp: bool = False
@@ -137,10 +135,7 @@ class TrainingConfig:
     # How often to compute and write total gradient norm to TensorBoard. Set to `None` to disable.
     write_gradient_norm: Optional[int] = None
 
-    output_dir: str = "${hydra:runtime.output_dir}"
-    save_freq: int = 1
-
-    debug: bool = False
+    save_freq: Optional[int] = None
 
     # Optimizer and Scheduler options
     learning_rate: float = 1e-5
@@ -150,80 +145,85 @@ class TrainingConfig:
     gradient_accumulation_steps: int = 1
 
 
-@trainer_store(zen_partial=True)  # Set `zen_partial=True` if you inherit from this trainer
+@dataclass
+class DebugConfig:
+    enable: bool = False
+    save_inputs: bool = False
+    save_inputs_for_each_step: bool = False
+
+
+# Set `zen_partial=True` if you inherit from this trainer
+@trainer_store(zen_partial=True)
 class Trainer:
     def __init__(
             self,
             datasets: Dict[str, data.Dataset], model: nn.Module, meter: Meter,
-            training_config: TrainingConfig = TrainingConfig(),
-            dataloader_config: DataLoaderConfig = DataLoaderConfig(),
-            training_strategy_config: TrainingStrategyConfig = TrainingStrategyConfig(),
-            optimizer: Optional[optim.Optimizer] = None,
-            scheduler: Optional[optim.lr_scheduler.LRScheduler] = None
+            do_train: bool = False, do_test: bool = False, do_eval: bool = False,
+            output_dir: str = "${hydra:runtime.output_dir}",
+            optimizer: Optional[optim.Optimizer] = None, scheduler: Optional[optim.lr_scheduler.LRScheduler] = None,
+            training: TrainingConfig = TrainingConfig(),
+            dataloader: DataLoaderConfig = DataLoaderConfig(),
+            training_strategy: TrainingStrategyConfig = TrainingStrategyConfig(),
+            debug: DebugConfig = DebugConfig()
     ):
-        cfg: TrainingConfig = training_config
-        self.cfg: TrainingConfig = cfg
-        self.dataloader_cfg: DataLoaderConfig = dataloader_config
-        self.training_strategy_cfg: TrainingStrategyConfig = training_strategy_config
+        self.do_train = do_train
+        self.do_test = do_test
+        self.do_eval = do_eval
+        self.output_dir = output_dir
+        self.training_cfg: TrainingConfig = training
+        self.dataloader_cfg: DataLoaderConfig = dataloader
+        self.training_strategy_cfg: TrainingStrategyConfig = training_strategy
+        self.debug_cfg = debug
 
-        assert cfg.write_histogram is None or not cfg.amp, \
+        assert self.training_cfg.write_histogram is None or not self.training_cfg.amp, \
             "If using AMP, `write_histogram_freq` cannot be enabled and must be set to `None`."
+        assert self.training_cfg.gradient_accumulation_steps >= 1, \
+            "`gradient_accumulation_steps` must be an integer greater or equal to 1."
 
-        torch.autograd.set_detect_anomaly(cfg.detect_anomaly)
-
+        torch.autograd.set_detect_anomaly(self.training_cfg.detect_anomaly)
         # Initialize distribution
         if not dist.is_initialized():
             dist.init_process_group(backend="nccl")
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))  # get RANK from environment
 
         self.dataset = datasets
-        self.dataloader = self.build_loader(datasets, cfg=dataloader_config)
-
+        self.dataloader = self.build_loader(datasets, cfg=dataloader)
         self.model_wrapped = self.model = model
+
         self.optimizer = optimizer
         self.scheduler = scheduler
-        self.meter = meter
+        self.meter: Meter = meter
+        self.scaler: GradScaler = GradScaler() if self.training_cfg.amp else None
 
-        self.resume = cfg.resume
-        self.output_dir = cfg.output_dir
-        self.save_freq = cfg.save_freq
+        self.save_freq = get_write_freq(self.training_cfg.save_freq)
+        self.write_loss_and_learning_rate_freq = get_write_freq(self.training_cfg.write_loss_and_learning_rate)
+        self.write_histogram_freq = get_write_freq(self.training_cfg.write_histogram)
+        self.write_gradient_norm_freq = get_write_freq(self.training_cfg.write_gradient_norm)
 
-        def get_write_freq(x: Optional[int]):
-            assert x is None or type(x) is int
-            return float("inf") if x is None else x
-
-        self.write_loss_and_learning_rate_freq = get_write_freq(cfg.write_loss_and_learning_rate)
-        self.write_histogram_freq = get_write_freq(cfg.write_histogram)
-        self.write_gradient_norm_freq = get_write_freq(cfg.write_gradient_norm)
-
-        self.enable_amp = cfg.amp
-        self.scaler: GradScaler = GradScaler() if cfg.amp else None
-        self.clip_norm = cfg.clip_norm
-
-        self.epoch_total = cfg.num_train_epochs
-        self.global_step = self.epoch = 0  # Init to 0
-
-        self.gradient_accumulation_step = cfg.gradient_accumulation_steps
-        assert self.gradient_accumulation_step >= 1
+        # Current training step and epoch
+        self.global_step = 0
+        self.epoch = 0
 
         self.info()
 
     def create_optimizer(self):
         logger.debug("Creating optimizer...")
-        self.optimizer = optim.AdamW(self.model_wrapped.parameters(), lr=self.cfg.learning_rate)
+        self.optimizer = optim.AdamW(self.model_wrapped.parameters(), lr=self.training_cfg.learning_rate)
         logger.info("Optimizer created successfully.")
 
     def create_scheduler(self, optimizer: optim.Optimizer):
         logger.debug("Creating scheduler...")
-        max_train_steps = math.ceil(len(self.dataloader["train"]) * self.epoch_total / self.gradient_accumulation_step)
-
+        max_train_steps = math.ceil(
+            len(self.dataloader["train"]) * self.training_cfg.num_train_epochs /
+            self.training_cfg.gradient_accumulation_steps
+        )
         warmup_steps = 0
-        assert (self.cfg.warmup_ratio is None) or (self.cfg.warmup_steps is None), \
+        assert (self.training_cfg.warmup_ratio is None) or (self.training_cfg.warmup_steps is None), \
             "Both warmup_ratio and warmup_steps should not be set simultaneously."
-        if self.cfg.warmup_ratio is not None:
-            warmup_steps = int(max_train_steps * self.cfg.warmup_ratio)
-        if self.cfg.warmup_steps is not None:
-            warmup_steps = self.cfg.warmup_steps
+        if self.training_cfg.warmup_ratio is not None:
+            warmup_steps = int(max_train_steps * self.training_cfg.warmup_ratio)
+        if self.training_cfg.warmup_steps is not None:
+            warmup_steps = self.training_cfg.warmup_steps
 
         self.scheduler = get_linear_schedule_with_warmup(optimizer=optimizer,
                                                          num_warmup_steps=warmup_steps,
@@ -433,7 +433,7 @@ class Trainer:
 
     def info(self):
         """CUSTOMIZE: to print some information"""
-        logger.info("Train Epoch: %d", self.epoch_total)
+        logger.info("Train Epoch: %d", self.training_cfg.num_train_epochs)
         trainable_params, all_param, trainable_params_names = get_trainable_parameters(self.model)
         logger.info("Trainable params: %d", trainable_params)
         logger.debug("Trainable params: \n\t%s", '\n\t'.join(trainable_params_names))
@@ -445,9 +445,9 @@ class Trainer:
         self.model_wrapped = self._wrap_model(self.model)
 
         # Resume from specified model, use for load pretrained weight
-        if self.resume is not None:
-            logger.info(f"Resume model parameters from {self.resume}.")
-            load_state_dict(self.model_wrapped, model_file=self.resume, strict=False)
+        if self.training_cfg.resume is not None:
+            logger.info(f"Resume model parameters from {self.training_cfg.resume}.")
+            load_state_dict(self.model_wrapped, model_file=self.training_cfg.resume, strict=False)
 
         # Build optimizer and scheduler before training if is not passed to trainer
         if self.optimizer is None:
@@ -456,7 +456,7 @@ class Trainer:
             self.create_scheduler(self.optimizer)
 
         # Resume from last checkpoint
-        if self.cfg.resume_from_checkpoint:
+        if self.training_cfg.resume_from_checkpoint:
             checkpoint_folder = self._get_last_checkpoint()
             if checkpoint_folder is not None:
                 logger.info("Resuming from the last checkpoint: %s", checkpoint_folder)
@@ -468,11 +468,11 @@ class Trainer:
         self.writer = get_writer(os.path.join(self.output_dir, "tensorboard"), purge_step=self.global_step)
 
     def _on_train(self):
-        for epoch in range(self.epoch, self.epoch_total):
+        for epoch in range(self.epoch, self.training_cfg.num_train_epochs):
             self.epoch = epoch
-            logger.debug(f"Epoch {epoch + 1}/{self.epoch_total}")
+            logger.debug(f"Epoch {epoch + 1}/{self.training_cfg.num_train_epochs}")
 
-            if self.cfg.do_train:
+            if self.do_train:
                 self._before_train_epoch()
                 self._on_train_epoch()
                 self._after_train_epoch()
@@ -480,7 +480,7 @@ class Trainer:
                 logger.warning("Training is disabled. Skipping training process...")
 
             # TODO: Add an option to set test frequency
-            if self.cfg.do_test:
+            if self.do_test:
                 self._before_test_epoch()
                 self._on_test_epoch()
                 self._after_test_epoch()
@@ -488,7 +488,7 @@ class Trainer:
                 logger.info("Testing is disabled. Skipping testing process...")
 
             # Only run test for once if training is disabled
-            if not self.cfg.do_train:
+            if not self.do_train:
                 break
 
     def _after_train(self):
@@ -508,9 +508,9 @@ class Trainer:
         train_dataloader = self._prefetch_to_gpu(self.dataloader["train"])
         model = self.model_wrapped
 
-        progress_bar = tqdm(desc=f"Train: {self.epoch + 1}/{self.epoch_total}",
+        progress_bar = tqdm(desc=f"Train: {self.epoch + 1}/{self.training_cfg.num_train_epochs}",
                             dynamic_ncols=True,
-                            total=len(train_dataloader) // self.gradient_accumulation_step,
+                            total=len(train_dataloader) // self.training_cfg.gradient_accumulation_steps,
                             disable=dist.is_initialized() and dist.get_rank() != 0)
 
         prof = torch.profiler.profile(
@@ -518,8 +518,8 @@ class Trainer:
             on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join(self.output_dir, "profiler")),
             record_shapes=False,
             with_stack=False
-        ) if self.cfg.write_profiler else None
-        if self.cfg.write_profiler:
+        ) if self.training_cfg.write_profiler else None
+        if self.training_cfg.write_profiler:
             logger.warning("Torch profiler is enabled, performance may be impacted.")
             prof.start()
 
@@ -528,15 +528,26 @@ class Trainer:
 
         logger.debug("Running train epoch for-loop...")
         for cur_step, inputs in enumerate(train_dataloader):
+            if self.debug_cfg.enable and self.debug_cfg.save_inputs:
+                if self.debug_cfg.save_inputs_for_each_step:
+                    inputs_save_path = os.path.join(self.output_dir, "inputs",
+                                                    f"rank_{dist.get_rank()}_step_{self.global_step}.pt")
+                else:
+                    inputs_save_path = os.path.join(self.output_dir, "inputs", f"rank_{dist.get_rank()}.pt")
+                os.makedirs(os.path.dirname(inputs_save_path), exist_ok=True)
+                torch.save(inputs, inputs_save_path)
+
             outputs, loss, loss_meta = self._train_step(model=model, inputs=inputs)
 
             loss_total += loss
             for k, v in loss_meta.items():
                 loss_meta_total[k] += v
 
-            if self.gradient_accumulation_step > 1:
-                progress_bar.set_postfix_str(f"Accumulation Step={(cur_step + 1) % self.gradient_accumulation_step}")
-            if (cur_step + 1) % self.gradient_accumulation_step == 0:
+            if self.training_cfg.gradient_accumulation_steps > 1:
+                progress_bar.set_postfix({
+                    "Accumulation Steps": (cur_step + 1) % self.training_cfg.gradient_accumulation_steps
+                })
+            if (cur_step + 1) % self.training_cfg.gradient_accumulation_steps == 0:
                 # summary
                 with torch.no_grad():
                     if (cur_step + 1) % self.write_histogram_freq == 0:
@@ -552,17 +563,17 @@ class Trainer:
                     )
 
                 # Clip by norm
-                if self.clip_norm is not None:
-                    if self.enable_amp:
+                if self.training_cfg.clip_norm is not None:
+                    if self.training_cfg.amp:
                         self.scaler.unscale_(self.optimizer)
 
                     if self.training_strategy_cfg.strategy == TrainingStrategy.fsdp:
-                        model.clip_grad_norm_(self.clip_norm)
+                        model.clip_grad_norm_(self.training_cfg.clip_norm)
                     else:
-                        nn.utils.clip_grad_norm_(model.parameters(), self.clip_norm)
+                        nn.utils.clip_grad_norm_(model.parameters(), self.training_cfg.clip_norm)
 
                 # Optimize
-                if self.enable_amp:
+                if self.training_cfg.amp:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
@@ -575,17 +586,17 @@ class Trainer:
                 loss_total = 0.
                 loss_meta_total = defaultdict(float)
                 progress_bar.update()
-                if self.cfg.write_profiler:
+                if self.training_cfg.write_profiler:
                     prof.step()
 
             # Exit if debug
-            if self.cfg.debug and cur_step + 1 >= 100 * self.gradient_accumulation_step:
+            if self.debug_cfg.enable and cur_step + 1 >= 100 * self.training_cfg.gradient_accumulation_steps:
                 logger.warning("Debug mode is enabled, only run for 100 step.")
                 break
 
         logger.debug("Train epoch for-loop finished.")
 
-        if self.cfg.write_profiler:
+        if self.training_cfg.write_profiler:
             prof.stop()
 
     def _train_step(
@@ -597,7 +608,7 @@ class Trainer:
         """
         model.train()
 
-        if self.enable_amp:
+        if self.training_cfg.amp:
             autocast_context_manager = autocast()
         else:
             autocast_context_manager = contextlib.nullcontext()
@@ -616,14 +627,14 @@ class Trainer:
         else:
             loss_meta = {}
 
-        if self.enable_amp:
+        if self.training_cfg.amp:
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
 
         # Divide with gradient accumulation steps and return
-        loss = loss.detach() / self.gradient_accumulation_step
-        loss_meta = {k: v.detach() / self.gradient_accumulation_step for k, v in loss_meta.items()}
+        loss = loss.detach() / self.training_cfg.gradient_accumulation_steps
+        loss_meta = {k: v.detach() / self.training_cfg.gradient_accumulation_steps for k, v in loss_meta.items()}
         return outputs, loss, loss_meta
 
     def _after_train_epoch(self):
@@ -675,9 +686,9 @@ class Trainer:
             self.dataloader["eval_sampler"].set_epoch(0)
 
         # Resume from specified model, use for load pretrained weight
-        if self.resume is not None:
-            logger.info(f"Resume model parameters from {self.resume}.")
-            load_state_dict(self.model_wrapped, model_file=self.resume, strict=False)
+        if self.training_cfg.resume is not None:
+            logger.info(f"Resume model parameters from {self.training_cfg.resume}.")
+            load_state_dict(self.model_wrapped, model_file=self.training_cfg.resume, strict=False)
 
         self.writer = get_writer(os.path.join(self.output_dir, "tensorboard"))
 
@@ -702,12 +713,12 @@ class Trainer:
         self.meter.reset()
 
     def run(self):
-        if self.cfg.do_train or self.cfg.do_test:
+        if self.do_train or self.do_test:
             self._before_train()
             self._on_train()
             self._after_train()
 
-        if self.cfg.do_eval:
+        if self.do_eval:
             self._before_eval()
             self._on_eval()
             self._after_eval()

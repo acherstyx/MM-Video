@@ -36,10 +36,13 @@ class Runner:
 
     """
 
+    def __init__(self, dataset_splits: List[str] = ("train", "test", "eval")):
+        self.dataset_splits = dataset_splits
+
     @staticmethod
-    def build_dataset(dataset_config: DictConfig) -> Dict[str, Dataset]:
+    def build_dataset(dataset_config: DictConfig, dataset_splits: List[str]) -> Dict[str, Dataset]:
         with Timer("Building dataset from the configuration..."):
-            dataset = {split: instantiate(dataset_config, split=split) for split in ("train", "test", "eval")}
+            dataset = {split: instantiate(dataset_config, split=split) for split in dataset_splits}
         return dataset
 
     @staticmethod
@@ -68,7 +71,7 @@ class Runner:
             manual_seed(cfg.system.seed)
 
         self.save_code()
-        dataset = self.build_dataset(cfg.dataset)
+        dataset = self.build_dataset(cfg.dataset, self.dataset_splits)
         model = self.build_model(cfg.model)
         meter = self.build_meter(cfg.meter)
 

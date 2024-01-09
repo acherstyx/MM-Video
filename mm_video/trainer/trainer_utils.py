@@ -15,7 +15,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["barrier", "get_module_class_from_name", "unwrap_model", "load_state_dict", "save_state_dict", "manual_seed"]
+__all__ = ["barrier", "get_module_class_from_name", "unwrap_model", "load_state_dict", "save_state_dict", "manual_seed",
+           "get_write_freq"]
 
 
 def barrier(debug_msg: Optional[str] = None, disabled: bool = False):
@@ -84,7 +85,7 @@ def load_state_dict(model: nn.Module, model_file: str, strict: bool = False):
 
 def save_state_dict(model: nn.Module, model_file: str):
     state_dict = model.state_dict()
-    os.makedirs(os.path.basename(model_file), exist_ok=True)
+    os.makedirs(os.path.dirname(model_file), exist_ok=True)
     torch.save(state_dict, model_file)
 
 
@@ -96,3 +97,14 @@ def manual_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
     logger.debug("Manual seed is set to %s", seed)
+
+
+def get_write_freq(x: Optional[int]):
+    """
+    Returns the frequency value for writing data.
+
+    If the input `x` is None, it implies an infinite frequency, the function returns `float('inf')`.
+    Otherwise, it returns the unchanged input value.
+    """
+    assert x is None or type(x) is int
+    return float("inf") if x is None else x
