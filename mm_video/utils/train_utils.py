@@ -10,7 +10,6 @@ import pickle
 import time
 import itertools
 import math
-from dataclasses import dataclass
 import logging
 from typing import *
 
@@ -18,16 +17,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import FullyShardedDataParallel
-from torch.distributed.fsdp.fully_sharded_data_parallel import _get_grad_norm
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class SystemConfig:
-    # deterministic
-    deterministic: bool = True
-    seed: int = 222
 
 
 def cuda(x: Union[torch.Tensor, Dict, List]):
@@ -179,22 +170,30 @@ def compute_total_gradient_norm(model: nn.Module, norm_type: float = 2.0) -> tor
     Compute gradient norm over all parameters.
     This needs to be called on all ranks since it uses collective communications.
     """
+    from torch.distributed.fsdp.fully_sharded_data_parallel import _get_grad_norm
+
     norm_type = float(norm_type)
     if isinstance(model, FullyShardedDataParallel):
+        print(model.clip_grad_norm_(max_norm=float('inf'), norm_type=norm_type))
         # The logic for computing the total gradient norm for FSDP is adopted from the `clip_grad_norm_` method
         # of FullyShardedDataParallel
 
         # If every FSDP instance uses `NO_SHARD`, then we can directly use
         # the normal `_get_grad_norm` to calculate the total gradient norm
+        if torch.__version__ < "2.1":
+            import torch.distributed.fsdp._traversal_utils as traversal_utils
+            all_handles = traversal_utils._get_fsdp_handles(model)
+        else:
+            all_handles = model._all_handles
         all_no_shard = all(
-            not handle.uses_sharded_strategy for handle in model._all_handles
+            not handle.uses_sharded_strategy for handle in all_handles
         )
         if all_no_shard:
             return _get_grad_norm(model.parameters(), norm_type=norm_type)
         sharded_params = set()
         nonsharded_params = set()  # `NO_SHARD` or not FSDP-managed
         grads: List[torch.Tensor] = []
-        for handle in model._all_handles:
+        for handle in all_handles:
             target_set = (
                 sharded_params if handle.uses_sharded_strategy else nonsharded_params
             )

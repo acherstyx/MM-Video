@@ -96,7 +96,7 @@ def manual_seed(seed):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
-    logger.debug("Manual seed is set to %s", seed)
+    logger.info("Manual seed is set to %s", seed)
 
 
 def get_write_freq(x: Optional[int]):

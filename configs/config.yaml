@@ -12,21 +12,26 @@ hydra:
   job_logging:
     version: 1
     formatters:
-      mm_video:
-        format: "[%(asctime)s][Rank ${oc.env:RANK}][%(levelname)s] %(filename)s %(lineno)d: %(message)s"
+      verbose:
+        format: "[%(asctime)s][Rank ${oc.env:RANK}][%(levelname)s] %(name)s %(lineno)d: %(message)s"
+      colorful:
+        '()': 'colorlog.ColoredFormatter'
+        format: "[%(log_color)s%(levelname)s%(reset)s][%(blue)s%(name)s%(reset)s]: %(message)s"
+        log_colors:
+          DEBUG: purple
+          INFO: green
+          WARNING: yellow
+          ERROR: red
+          CRITICAL: red
     handlers:
       console:
-        class: logging.StreamHandler
-        formatter: simple
         level: INFO
+        class: logging.StreamHandler
+        formatter: colorful
       file:
         level: DEBUG
-        formatter: mm_video
+        formatter: verbose
         filename: "${hydra.runtime.output_dir}/${hydra.job.name}_rank_${oc.env:RANK}.log"
-    loggers:
-      mm_video:
-        level: DEBUG
-        handlers: [ file ]
-        propagate: no
     root:
-      handlers: [ ]
+      level: DEBUG
+      handlers: [ file, console ]

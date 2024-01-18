@@ -14,7 +14,7 @@ classifiers = [
 ]
 dependencies = [
     # configuration
-    "omegaconf", "hydra-core", "hydra-zen",
+    "omegaconf", "hydra-core", "hydra-zen", "colorlog",
     # basic
     "tensorboard",
     "tqdm",

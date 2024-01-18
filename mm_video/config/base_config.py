@@ -11,15 +11,27 @@ from omegaconf import OmegaConf, MISSING
 from dataclasses import dataclass, field
 from typing import List, Any, Optional
 
-# import config nodes
-from mm_video.utils.train_utils import SystemConfig
-from mm_video.utils.logging import LogConfig
-
 """
 Define the structure of base configuration for this template
 """
 
 __all__ = ["BaseConfig"]
+
+
+@dataclass
+class SystemConfig:
+    # deterministic
+    deterministic: bool = True
+    seed: int = 210222
+
+
+@dataclass
+class LogConfig:
+    # info/metadata
+
+    root: str = "log"  # log root
+    project_name: str = "unnamed_project"  # this should be set to determine the output directory
+    experiment_name: str = "unnamed_experiment"  # this should be set to determine the output directory
 
 
 @dataclass
@@ -35,6 +47,7 @@ class BaseConfig:
     # Basic information configuration
     system: SystemConfig = field(default_factory=SystemConfig)
     log: LogConfig = field(default_factory=LogConfig)
+    paths: Any = MISSING
 
     # Main component configuration
     dataset: Any = MISSING
