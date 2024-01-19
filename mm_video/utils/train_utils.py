@@ -138,7 +138,7 @@ def conditional_gather_object_multiple_gpu(
 
 
 # from peft: https://github.com/huggingface/peft/blob/main/src/peft/peft_model.py
-def get_trainable_parameters(model: torch.nn.Module):
+def get_trainable_parameters(model: torch.nn.Module) -> Tuple[int, int, List[str]]:
     r"""
     Returns the number of trainable parameters and number of all parameters in the model.
     """
@@ -174,7 +174,6 @@ def compute_total_gradient_norm(model: nn.Module, norm_type: float = 2.0) -> tor
 
     norm_type = float(norm_type)
     if isinstance(model, FullyShardedDataParallel):
-        print(model.clip_grad_norm_(max_norm=float('inf'), norm_type=norm_type))
         # The logic for computing the total gradient norm for FSDP is adopted from the `clip_grad_norm_` method
         # of FullyShardedDataParallel
 
@@ -242,13 +241,35 @@ def compute_total_gradient_norm(model: nn.Module, norm_type: float = 2.0) -> tor
         return _get_grad_norm(parameters, norm_type=norm_type)
 
 
+def get_rank() -> int:
+    """
+    Get (global) rank from environment variable set by `torchrun`.
+    """
+    return int(os.environ.get("RANK", 0))
+
+
 def get_world_size() -> int:
     """
-    Get world size from environment variable set by `torchrun`.
-
+    Get (global) world size from environment variable set by `torchrun`.
     """
     return int(os.environ.get("WORLD_SIZE", 1))
 
 
-def get_rank() -> int:
-    return int(os.environ.get("RANK", 0))
+def get_local_rank() -> int:
+    return int(os.environ.get("LOCAL_RANK", 0))
+
+
+def get_local_world_size() -> int:
+    return int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+
+
+def get_master_addr() -> str:
+    return os.environ.get("MASTER_ADDR")
+
+
+def get_master_port() -> Union[int, None]:
+    port = os.environ.get("MASTER_PORT", None)
+    if port is not None:
+        return int(port)
+    else:
+        return None

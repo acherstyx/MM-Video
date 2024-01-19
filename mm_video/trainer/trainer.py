@@ -37,7 +37,8 @@ from mm_video.config import trainer_store
 from mm_video.modeling.meter import Meter
 from mm_video.modeling.optimization import get_linear_schedule_with_warmup
 from mm_video.utils.train_utils import (
-    CudaPreFetcher, get_trainable_parameters, compute_total_gradient_norm, get_world_size
+    CudaPreFetcher, get_trainable_parameters, compute_total_gradient_norm,
+    get_world_size, get_local_rank, get_master_addr, get_master_port
 )
 from mm_video.utils.writer import get_writer
 from mm_video.utils.profile import Timer
@@ -183,6 +184,9 @@ class Trainer:
         torch.autograd.set_detect_anomaly(self.training_cfg.detect_anomaly)
         # Initialize distribution
         if not dist.is_initialized():
+            if get_local_rank() == 0:
+                logger.info("Distributed training config:\n\tMaster IP: %s\n\tMaster port: %s\n\tWorld size: %s",
+                            get_master_addr(), get_master_port(), get_world_size())
             dist.init_process_group(backend="nccl")
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))  # get RANK from environment
 
@@ -433,12 +437,16 @@ class Trainer:
 
     def info(self):
         """CUSTOMIZE: to print some information"""
-        logger.info("Train Epoch: %d", self.training_cfg.num_train_epochs)
+        logger.info("Training Epoch: %d", self.training_cfg.num_train_epochs)
+
         trainable_params, all_param, trainable_params_names = get_trainable_parameters(self.model)
-        logger.info("Trainable params: %d", trainable_params)
-        logger.debug("Trainable params: \n\t%s", '\n\t'.join(trainable_params_names))
-        logger.info("All params: %d", all_param)
-        logger.info("Trainable%%: %f", 100 * trainable_params / all_param)
+        logger.info("Total parameters: %d", all_param)
+        logger.info("Trainable parameters: %d", trainable_params)
+        logger.info("Trainable percentage: %f", 100 * trainable_params / all_param)
+        logger.debug(
+            "Full list of parameters (* indicates frozen parameters):\n\t%s",
+            '\n\t'.join([(p if p in trainable_params_names else f"{p} *") for p, _ in self.model.named_parameters()])
+        )
 
     def _before_train(self):
         # Wrap model before training
