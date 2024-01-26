@@ -236,7 +236,7 @@ class Trainer:
 
     @property
     def should_write(self) -> bool:
-        return not dist.is_initialized() or dist.get_rank() == 0
+        return get_local_rank() == 0
 
     def save_model(self, output_dir: Optional[str] = None, state_dict: Optional[Any] = None):
         """
@@ -436,17 +436,19 @@ class Trainer:
         return dataloader
 
     def info(self):
-        """CUSTOMIZE: to print some information"""
-        logger.info("Training Epoch: %d", self.training_cfg.num_train_epochs)
-
+        """CUSTOMIZE: to print some useful information"""
         trainable_params, all_param, trainable_params_names = get_trainable_parameters(self.model)
-        logger.info("Total parameters: %d", all_param)
-        logger.info("Trainable parameters: %d", trainable_params)
-        logger.info("Trainable percentage: %f", 100 * trainable_params / all_param)
         logger.debug(
             "Full list of parameters (* indicates frozen parameters):\n\t%s",
             '\n\t'.join([(p if p in trainable_params_names else f"{p} *") for p, _ in self.model.named_parameters()])
         )
+
+        if self.should_write:
+            logger.info("Training Epoch: %d", self.training_cfg.num_train_epochs)
+
+            logger.info("Total parameters: %d", all_param)
+            logger.info("Trainable parameters: %d", trainable_params)
+            logger.info("Trainable percentage: %f", 100 * trainable_params / all_param)
 
     def _before_train(self):
         # Wrap model before training
@@ -760,7 +762,7 @@ class Trainer:
 
     @torch.no_grad()
     def _write_loss_and_learning_rate(
-            self, loss: torch.Tensor, loss_meta: Union[torch.Tensor, Dict[str, torch.Tensor]]
+            self, loss: torch.Tensor, loss_meta: Optional[Dict[str, torch.Tensor]] = None
     ):
         """
         Writes training loss, loss metadata, and learning rate to TensorBoard.
@@ -772,12 +774,15 @@ class Trainer:
         if dist.is_initialized():
             dist.all_reduce(loss)
             loss /= dist.get_world_size()
-            for k in sorted(loss_meta.keys()):
-                dist.all_reduce(loss_meta[k])
-                loss_meta[k] /= dist.get_world_size()
+            if loss_meta is not None:
+                # NOTICE: The keys in meta loss dict must be the same across all ranks to avoid any collective error
+                for k in sorted(loss_meta.keys()):
+                    dist.all_reduce(loss_meta[k])
+                    loss_meta[k] /= dist.get_world_size()
 
-        self.writer.add_scalar("train/loss", loss, global_step=self.global_step)
-        if isinstance(loss_meta, dict):
+        self.writer.add_scalar("train/loss", loss.detach().cpu().float(), global_step=self.global_step)
+        if loss_meta is not None:
+            loss_meta = {k: v.detach().cpu().float() for k, v in loss_meta.items()}
             self.writer.add_scalars("train/loss_meta", loss_meta, global_step=self.global_step)
 
         learning_rate = [group["lr"] if self.scheduler is None else group for group in
@@ -787,6 +792,6 @@ class Trainer:
 
         logger.debug(
             f"Step: %s | Loss: %s | Learning rate: %s",
-            self.global_step, loss.cpu().detach().numpy(),
+            self.global_step, loss.detach().cpu().numpy(),
             learning_rate[0] if len(learning_rate) == 1 else learning_rate
         )
