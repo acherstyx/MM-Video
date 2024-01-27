@@ -12,7 +12,8 @@ from tqdm import tqdm
 import logging
 
 from hydra.utils import get_object
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
+import json
 from enum import Enum
 from typing import *
 
@@ -56,9 +57,11 @@ PREFIX_CHECKPOINT_DIR = "checkpoint"
 MODEL_NAME = "pytorch_model"
 OPTIMIZER_NAME = "optimizer"
 SCHEDULER_NAME = "scheduler"
+TRAINER_STATE_NAME = "trainer_state"
 MODEL_NAME_BIN = f"{MODEL_NAME}.bin"
 OPTIMIZER_NAME_BIN = f"{OPTIMIZER_NAME}.bin"
 SCHEDULER_NAME_BIN = f"{SCHEDULER_NAME}.bin"
+TRAINER_STATE_NAME_BIN = f"{TRAINER_STATE_NAME}.json"
 
 
 @dataclass
@@ -137,6 +140,7 @@ class TrainingConfig:
     write_gradient_norm: Optional[int] = None
 
     save_freq: Optional[int] = None
+    save_steps: Optional[int] = None
 
     # Optimizer and Scheduler options
     learning_rate: float = 1e-5
@@ -151,6 +155,26 @@ class DebugConfig:
     enable: bool = False
     save_inputs: bool = False
     save_inputs_for_each_step: bool = False
+
+
+@dataclass
+class TrainerState:
+    epoch: int = 0
+    global_step: int = 0
+    skip_step: int = 0
+
+    def save_to_json(self, json_path: str):
+        """Save the content of this instance in JSON format inside `json_path`."""
+        json_string = json.dumps(asdict(self), indent=2, sort_keys=True) + "\n"
+        with open(json_path, "w", encoding="utf-8") as f:
+            f.write(json_string)
+
+    @classmethod
+    def load_from_json(cls, json_path: str):
+        """Create an instance from the content of `json_path`."""
+        with open(json_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        return cls(**json.loads(text))
 
 
 # Set `zen_partial=True` if you inherit from this trainer
@@ -199,14 +223,7 @@ class Trainer:
         self.meter: Meter = meter
         self.scaler: GradScaler = GradScaler() if self.training_cfg.amp else None
 
-        self.save_freq = get_write_freq(self.training_cfg.save_freq)
-        self.write_loss_and_learning_rate_freq = get_write_freq(self.training_cfg.write_loss_and_learning_rate)
-        self.write_histogram_freq = get_write_freq(self.training_cfg.write_histogram)
-        self.write_gradient_norm_freq = get_write_freq(self.training_cfg.write_gradient_norm)
-
-        # Current training step and epoch
-        self.global_step = 0
-        self.epoch = 0
+        self.state = TrainerState()
 
         self.info()
 
@@ -263,7 +280,7 @@ class Trainer:
         Save current training status to checkpoint
 
         """
-        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.global_step}"
+        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
         output_dir = os.path.join(self.output_dir, checkpoint_folder)
         logger.debug("Saving trainer checkpoint to %s", output_dir)
         os.makedirs(output_dir, exist_ok=True)
@@ -272,16 +289,17 @@ class Trainer:
         state_dict = self.model_wrapped.state_dict()
         if self.should_write:
             self.save_model(output_dir=output_dir, state_dict=state_dict)
-
         # Save optimizer
         if self.should_write:
             torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME_BIN))
-
         # Save scheduler
         if self.should_write and self.scheduler is not None:
             torch.save(self.scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME_BIN))
+        # Save trainer state
+        if self.should_write:
+            self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME_BIN))
 
-        logger.debug("Checkpoint is saved successfully.")
+        logger.info("Checkpoint is saved to %s", output_dir)
 
     def _load_checkpoint(self, checkpoint: str):
         """
@@ -293,20 +311,22 @@ class Trainer:
         # Load model states
         model_state_dict = torch.load(os.path.join(checkpoint, MODEL_NAME_BIN), map_location="cpu")
         self.model_wrapped.load_state_dict(model_state_dict)
-
         # Load optimizer
         optimizer_file = os.path.join(checkpoint, OPTIMIZER_NAME_BIN)
         if os.path.exists(optimizer_file):
             self.optimizer.load_state_dict(torch.load(optimizer_file, map_location="cpu"))
-
         # Load scheduler
         scheduler_file = os.path.join(checkpoint, SCHEDULER_NAME_BIN)
         if os.path.exists(scheduler_file):
             self.scheduler.load_state_dict(torch.load(scheduler_file, map_location="cpu"))
+        # Load trainer state
+        trainer_state_file = os.path.join(checkpoint, TRAINER_STATE_NAME_BIN)
+        if os.path.exists(trainer_state_file):
+            self.state = TrainerState.load_from_json(trainer_state_file)
+            # Skip the steps from the previous run
+            self.state.skip_step = self.state.global_step
 
-        logger.info("Checkpoint is loaded successfully.")
-
-        # TODO: skip epoch and set train step after load checkpoint
+        logger.info("Resume from step %s", self.state.global_step)
 
     def _get_last_checkpoint(self) -> Optional[str]:
         """
@@ -316,6 +336,8 @@ class Trainer:
         checkpoint_folder_pattern = f"{PREFIX_CHECKPOINT_DIR}-[0-9]*"
         checkpoint_folders = glob.glob(os.path.join(self.output_dir, checkpoint_folder_pattern))
         checkpoint_folders = [f for f in checkpoint_folders if os.path.isdir(f)]
+        checkpoint_folders = [f for f in checkpoint_folders if os.path.exists(os.path.join(f, TRAINER_STATE_NAME_BIN))]
+        logger.debug("checkpoints found in the output directory: %s", checkpoint_folders)
         if checkpoint_folders:
             last_checkpoint_folder = sorted(checkpoint_folders, key=lambda x: int(re.findall(r"\d+", x)[-1]))[-1]
             logger.debug("Found the last checkpoint at: %s.", last_checkpoint_folder)
@@ -475,11 +497,11 @@ class Trainer:
                 logger.warning("`resume_from_checkpoint` is enabled, "
                                "but no checkpoint is found in the output directory.")
 
-        self.writer = get_writer(os.path.join(self.output_dir, "tensorboard"), purge_step=self.global_step)
+        self.writer = get_writer(os.path.join(self.output_dir, "tensorboard"), purge_step=self.state.global_step)
 
     def _on_train(self):
-        for epoch in range(self.epoch, self.training_cfg.num_train_epochs):
-            self.epoch = epoch
+        for epoch in range(self.state.epoch, self.training_cfg.num_train_epochs):
+            self.state.epoch = epoch
             logger.debug(f"Epoch {epoch + 1}/{self.training_cfg.num_train_epochs}")
 
             if self.do_train:
@@ -511,14 +533,14 @@ class Trainer:
         torch.cuda.empty_cache()
         barrier(debug_msg="training loop")
         if "train_sampler" in self.dataloader:
-            logger.debug(f"set train sampler step to {self.epoch}")
-            self.dataloader["train_sampler"].set_epoch(self.epoch)
+            logger.debug(f"set train sampler step to {self.state.epoch}")
+            self.dataloader["train_sampler"].set_epoch(self.state.epoch)
 
     def _on_train_epoch(self):
         train_dataloader = self._prefetch_to_gpu(self.dataloader["train"])
         model = self.model_wrapped
 
-        progress_bar = tqdm(desc=f"Train: {self.epoch + 1}/{self.training_cfg.num_train_epochs}",
+        progress_bar = tqdm(desc=f"Train: {self.state.epoch + 1}/{self.training_cfg.num_train_epochs}",
                             dynamic_ncols=True,
                             total=len(train_dataloader) // self.training_cfg.gradient_accumulation_steps,
                             disable=dist.is_initialized() and dist.get_rank() != 0)
@@ -538,10 +560,18 @@ class Trainer:
 
         logger.debug("Running train epoch for-loop...")
         for cur_step, inputs in enumerate(train_dataloader):
+            if self.state.skip_step > 0:
+                progress_bar.set_postfix({"Skip for resume": f"{self.state.skip_step} steps left"})
+                if cur_step % self.training_cfg.gradient_accumulation_steps == 0:
+                    self.state.skip_step -= 1
+                continue
+            else:
+                progress_bar.set_postfix({}, refresh=False)
+
             if self.debug_cfg.enable and self.debug_cfg.save_inputs:
                 if self.debug_cfg.save_inputs_for_each_step:
                     inputs_save_path = os.path.join(self.output_dir, "inputs",
-                                                    f"rank_{dist.get_rank()}_step_{self.global_step}.pt")
+                                                    f"rank_{dist.get_rank()}_step_{self.state.global_step}.pt")
                 else:
                     inputs_save_path = os.path.join(self.output_dir, "inputs", f"rank_{dist.get_rank()}.pt")
                 os.makedirs(os.path.dirname(inputs_save_path), exist_ok=True)
@@ -560,16 +590,16 @@ class Trainer:
             if (cur_step + 1) % self.training_cfg.gradient_accumulation_steps == 0:
                 # summary
                 with torch.no_grad():
-                    if (cur_step + 1) % self.write_histogram_freq == 0:
+                    if (cur_step + 1) % get_write_freq(self.training_cfg.write_histogram) == 0:
                         self._write_histogram()
-                    if (cur_step + 1) % self.write_gradient_norm_freq == 0:
+                    if (cur_step + 1) % get_write_freq(self.training_cfg.write_gradient_norm) == 0:
                         self._write_total_gradient_norm()
-                    if (cur_step + 1) % self.write_loss_and_learning_rate_freq == 0:
+                    if (cur_step + 1) % get_write_freq(self.training_cfg.write_loss_and_learning_rate) == 0:
                         # noinspection PyTypeChecker
                         self._write_loss_and_learning_rate(loss=loss_total, loss_meta=loss_meta_total)
                     self.meter.update(
                         inputs=inputs, outputs=outputs,
-                        writer=self.writer, main_tag="train", global_step=self.global_step
+                        writer=self.writer, main_tag="train", global_step=self.state.global_step
                     )
 
                 # Clip by norm
@@ -592,12 +622,16 @@ class Trainer:
 
                 if self.scheduler is not None:
                     self.scheduler.step()
-                self.global_step += 1
+                self.state.global_step += 1
                 loss_total = 0.
                 loss_meta_total = defaultdict(float)
                 progress_bar.update()
                 if self.training_cfg.write_profiler:
                     prof.step()
+
+                # Save checkpoint periodically based on steps
+                if self.state.global_step % get_write_freq(self.training_cfg.save_steps) == 0:
+                    self._save_checkpoint()
 
             # Exit if debug
             if self.debug_cfg.enable and cur_step + 1 >= 100 * self.training_cfg.gradient_accumulation_steps:
@@ -651,10 +685,10 @@ class Trainer:
         # reset optimizer
         self.optimizer.zero_grad()
         # write metric and reset meter
-        self.meter.summary(writer=self.writer, main_tag="train", global_step=self.global_step)
+        self.meter.summary(writer=self.writer, main_tag="train", global_step=self.state.global_step)
         self.meter.reset()
         # save checkpoint
-        if (self.epoch + 1) % self.save_freq == 0:
+        if (self.state.epoch + 1) % get_write_freq(self.training_cfg.save_freq) == 0:
             self._save_checkpoint()
         torch.cuda.empty_cache()
 
@@ -662,15 +696,15 @@ class Trainer:
         torch.cuda.empty_cache()
         barrier(debug_msg="test epoch")
         if "test_sampler" in self.dataloader:
-            logger.debug(f"set test sampler step to {self.epoch}")
-            self.dataloader["test_sampler"].set_epoch(self.epoch)
+            logger.debug(f"set test sampler step to {self.state.epoch}")
+            self.dataloader["test_sampler"].set_epoch(self.state.epoch)
 
     @torch.no_grad()
     def _on_test_epoch(self):
         model = self.model_wrapped
         dataloader = self._prefetch_to_gpu(self.dataloader["test"])
 
-        progress_bar = tqdm(desc=f"Test on epoch {self.epoch + 1}", dynamic_ncols=True, total=len(dataloader),
+        progress_bar = tqdm(desc=f"Test on epoch {self.state.epoch + 1}", dynamic_ncols=True, total=len(dataloader),
                             disable=not self.should_write)
 
         for inputs in dataloader:
@@ -678,13 +712,13 @@ class Trainer:
             outputs = self.model(inputs)
             self.meter.update(
                 inputs=inputs, outputs=outputs,
-                writer=self.writer, main_tag="test", global_step=self.epoch
+                writer=self.writer, main_tag="test", global_step=self.state.epoch
             )
             progress_bar.update()
 
     def _after_test_epoch(self):
         # write metric and reset meter
-        self.meter.summary(writer=self.writer, main_tag="test", global_step=self.epoch)
+        self.meter.summary(writer=self.writer, main_tag="test", global_step=self.state.epoch)
         self.meter.reset()
         torch.cuda.empty_cache()
 
@@ -714,12 +748,12 @@ class Trainer:
             outputs = self.model(inputs)
             self.meter.update(
                 inputs=inputs, outputs=outputs,
-                writer=self.writer, main_tag="eval", global_step=self.epoch
+                writer=self.writer, main_tag="eval", global_step=self.state.epoch
             )
             process_bar.update()
 
     def _after_eval(self):
-        self.meter.summary(writer=self.writer, main_tag="eval", global_step=self.epoch)
+        self.meter.summary(writer=self.writer, main_tag="eval", global_step=self.state.epoch)
         self.meter.reset()
 
     def run(self):
@@ -743,9 +777,9 @@ class Trainer:
         """
         with Timer("Writing histogram..."):
             for n, p in self.model.named_parameters():
-                self.writer.add_histogram(f"weight/{n}", p.detach().float(), global_step=self.global_step)
+                self.writer.add_histogram(f"weight/{n}", p.detach().float(), global_step=self.state.global_step)
                 if p.grad is not None:
-                    self.writer.add_histogram(f"grad/{n}", p.grad.detach().float(), global_step=self.global_step)
+                    self.writer.add_histogram(f"grad/{n}", p.grad.detach().float(), global_step=self.state.global_step)
 
     @torch.no_grad()
     def _write_total_gradient_norm(self):
@@ -757,8 +791,8 @@ class Trainer:
         """
         with Timer("Writing total gradient norm..."):
             total_norm = compute_total_gradient_norm(self.model)
-            logger.debug(f"Step: {self.global_step} | Total gradient norm: {total_norm}")
-            self.writer.add_scalar("train/norm", total_norm, global_step=self.global_step)
+            logger.debug(f"Step: {self.state.global_step} | Total gradient norm: {total_norm}")
+            self.writer.add_scalar("train/norm", total_norm, global_step=self.state.global_step)
 
     @torch.no_grad()
     def _write_loss_and_learning_rate(
@@ -780,18 +814,18 @@ class Trainer:
                     dist.all_reduce(loss_meta[k])
                     loss_meta[k] /= dist.get_world_size()
 
-        self.writer.add_scalar("train/loss", loss.detach().cpu().float(), global_step=self.global_step)
+        self.writer.add_scalar("train/loss", loss.detach().cpu().float(), global_step=self.state.global_step)
         if loss_meta is not None:
             loss_meta = {k: v.detach().cpu().float() for k, v in loss_meta.items()}
-            self.writer.add_scalars("train/loss_meta", loss_meta, global_step=self.global_step)
+            self.writer.add_scalars("train/loss_meta", loss_meta, global_step=self.state.global_step)
 
         learning_rate = [group["lr"] if self.scheduler is None else group for group in
                          (self.optimizer.param_groups if self.scheduler is None else self.scheduler.get_last_lr())]
         self.writer.add_scalars("train/lr", {f"param_group_{i}": lr for i, lr in enumerate(learning_rate)},
-                                global_step=self.global_step)
+                                global_step=self.state.global_step)
 
         logger.debug(
             f"Step: %s | Loss: %s | Learning rate: %s",
-            self.global_step, loss.detach().cpu().numpy(),
+            self.state.global_step, loss.detach().cpu().numpy(),
             learning_rate[0] if len(learning_rate) == 1 else learning_rate
         )
