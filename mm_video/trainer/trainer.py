@@ -563,6 +563,7 @@ class Trainer:
             if self.state.skip_step > 0:
                 progress_bar.set_postfix({"Skip for resume": f"{self.state.skip_step} steps left"})
                 if cur_step % self.training_cfg.gradient_accumulation_steps == 0:
+                    progress_bar.update()
                     self.state.skip_step -= 1
                 continue
             else:
