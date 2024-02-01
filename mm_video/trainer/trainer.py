@@ -39,7 +39,8 @@ from mm_video.modeling.meter import Meter
 from mm_video.modeling.optimization import get_linear_schedule_with_warmup
 from mm_video.utils.train_utils import (
     CudaPreFetcher, get_trainable_parameters, compute_total_gradient_norm,
-    get_world_size, get_local_rank, get_master_addr, get_master_port
+    get_world_size, get_local_rank, get_master_addr, get_master_port,
+    save_rng_state, load_rng_state
 )
 from mm_video.utils.writer import get_writer
 from mm_video.utils.profile import Timer
@@ -162,6 +163,7 @@ class TrainerState:
     epoch: int = 0
     global_step: int = 0
     skip_step: int = 0
+    resume_checkpoint: str = None
 
     def save_to_json(self, json_path: str):
         """Save the content of this instance in JSON format inside `json_path`."""
@@ -287,6 +289,8 @@ class Trainer:
 
         # Save model status
         state_dict = self.model_wrapped.state_dict()
+        # Save rng status
+        save_rng_state(output_dir)
         if self.should_write:
             self.save_model(output_dir=output_dir, state_dict=state_dict)
         # Save optimizer
@@ -308,6 +312,7 @@ class Trainer:
         """
         logger.info("Loading checkpoint from %s", checkpoint)
 
+        # TODO: Save checkpoint for fsdp model and optimizer, and resume from the saved checkpoint
         # Load model states
         model_state_dict = torch.load(os.path.join(checkpoint, MODEL_NAME_BIN), map_location="cpu")
         self.model_wrapped.load_state_dict(model_state_dict)
@@ -325,6 +330,7 @@ class Trainer:
             self.state = TrainerState.load_from_json(trainer_state_file)
             # Skip the steps from the previous run
             self.state.skip_step = self.state.global_step
+            self.state.resume_checkpoint = checkpoint
 
         logger.info("Resume from step %s", self.state.global_step)
 
@@ -370,7 +376,7 @@ class Trainer:
                 collate_fn=collate_fn,
                 pin_memory=cfg.pin_memory,
                 persistent_workers=False,
-                prefetch_factor=cfg.prefetch_factor,
+                prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
                 multiprocessing_context=cfg.multiprocessing_context if cfg.num_workers else None
             )
 
@@ -565,6 +571,10 @@ class Trainer:
                 if cur_step % self.training_cfg.gradient_accumulation_steps == 0:
                     progress_bar.update()
                     self.state.skip_step -= 1
+                if self.state.skip_step == 0:
+                    logger.debug("Resuming random status before training from checkpoint: %s",
+                                 self.state.resume_checkpoint)
+                    load_rng_state(self.state.resume_checkpoint)
                 continue
             else:
                 progress_bar.set_postfix({}, refresh=False)

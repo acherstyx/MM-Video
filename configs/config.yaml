@@ -31,7 +31,7 @@ hydra:
       file:
         level: DEBUG
         formatter: verbose
-        filename: "${hydra.runtime.output_dir}/${hydra.job.name}_rank_${oc.env:RANK}.log"
+        filename: "${hydra.runtime.output_dir}/${hydra.job.name}_node_${oc.env:GROUP_RANK}.log"
     root:
       level: DEBUG
       handlers: [ file, console ]

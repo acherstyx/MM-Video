@@ -11,6 +11,8 @@ import time
 import itertools
 import math
 import logging
+import random
+import numpy as np
 from typing import *
 
 import torch
@@ -239,6 +241,72 @@ def compute_total_gradient_norm(model: nn.Module, norm_type: float = 2.0) -> tor
     else:
         parameters = [p for p in model.parameters() if p.grad is not None]
         return _get_grad_norm(parameters, norm_type=norm_type)
+
+
+def save_rng_state(output_dir):
+    """
+    Based on `transformers.Trainer._save_rng_state`.
+
+    :param output_dir:
+    :return:
+    """
+    rng_states = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "cpu": torch.random.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        if dist.is_initialized():
+            # In non distributed, we save the global CUDA RNG state (will take care of DataParallel)
+            rng_states["cuda"] = torch.cuda.random.get_rng_state_all()
+        else:
+            rng_states["cuda"] = torch.cuda.random.get_rng_state()
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    if get_world_size() <= 1:
+        torch.save(rng_states, os.path.join(output_dir, "rng_state.pth"))
+    else:
+        torch.save(rng_states, os.path.join(output_dir, f"rng_state_{get_rank()}.pth"))
+
+
+def load_rng_state(checkpoint):
+    if checkpoint is None:
+        return
+
+    if get_world_size() <= 1:
+        rng_file = os.path.join(checkpoint, "rng_state.pth")
+        if not os.path.isfile(rng_file):
+            logger.warning(
+                "Didn't find an RNG file, if you are resuming a training that was launched in a distributed "
+                "fashion, reproducibility is not guaranteed."
+            )
+            return
+    else:
+        process_index = get_rank()
+        rng_file = os.path.join(checkpoint, f"rng_state_{process_index}.pth")
+        if not os.path.isfile(rng_file):
+            logger.warning(
+                f"Didn't find an RNG file for process {process_index}, if you are resuming a training that "
+                "wasn't launched in a distributed fashion, reproducibility is not guaranteed."
+            )
+            return
+
+    checkpoint_rng_state = torch.load(rng_file)
+    random.setstate(checkpoint_rng_state["python"])
+    np.random.set_state(checkpoint_rng_state["numpy"])
+    torch.random.set_rng_state(checkpoint_rng_state["cpu"])
+    if torch.cuda.is_available():
+        if dist.is_initialized():
+            torch.cuda.random.set_rng_state_all(checkpoint_rng_state["cuda"])
+        else:
+            try:
+                torch.cuda.random.set_rng_state(checkpoint_rng_state["cuda"])
+            except Exception as e:
+                logger.warning(
+                    f"Didn't manage to set back the RNG states of the GPU because of the following error:\n {e}"
+                    "\nThis won't yield the same results as if the training had not been interrupted."
+                )
 
 
 def get_rank() -> int:
