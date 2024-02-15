@@ -7,7 +7,7 @@ hydra:
   run:
     dir: "${log.root}/${log.project_name}/${log.experiment_name}"
   sweep:
-    dir: "${log.root}/${log.project_name}/multirun"
+    dir: "${log.root}/${log.project_name}/${log.experiment_name}/multirun"
     subdir: ${hydra.job.override_dirname}
   job_logging:
     version: 1
