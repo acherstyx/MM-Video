@@ -7,7 +7,7 @@
 import hydra
 from hydra.utils import instantiate
 from hydra.core.hydra_config import HydraConfig
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from typing import *
 
 import os
@@ -41,8 +41,29 @@ class Runner:
 
     @staticmethod
     def build_dataset(dataset_config: DictConfig, dataset_splits: List[str]) -> Dict[str, Dataset]:
-        with Timer("Building dataset from the configuration..."):
-            dataset = {split: instantiate(dataset_config, split=split) for split in dataset_splits}
+        def is_target(x: Any) -> bool:
+            if isinstance(x, dict):
+                return "_target_" in x
+            if OmegaConf.is_dict(x):
+                return "_target_" in x
+            return False
+
+        if is_target(dataset_config):
+            with Timer("Building dataset from the configuration..."):
+                dataset = {split: instantiate(dataset_config, split=split) for split in dataset_splits}
+        elif (all(k in ("train", "test", "eval") for k in dataset_config.keys()) and
+              all(is_target(v) or v is None for k, v in dataset_config.items())):
+            # Allow selecting different dataset for train, test and eval
+            # See https://stackoverflow.com/a/71371396 for the config syntax
+            # Example:
+            # ```
+            # defaults:
+            #   - /dataset@dataset.train: TrainSet
+            #   - /dataset@dataset.test: TestSet
+            # ```
+            dataset = {k: instantiate(v) for k, v in dataset_config.items() if v is not None}
+        else:
+            raise ValueError(f"Dataset config is invalid: \n{OmegaConf.to_yaml(dataset_config)}")
         return dataset
 
     @staticmethod
