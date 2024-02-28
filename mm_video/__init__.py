@@ -4,4 +4,8 @@
 # @Project : MM-Video
 # @File    : __init__.py
 
-from . import config
+from . import config, trainer, runner
+
+import warnings
+
+warnings.filterwarnings("default", category=DeprecationWarning, module="mm_video")
