@@ -1,6 +1,6 @@
 # @package _global_
 defaults:
-  - base_config
+  - mm_video_structured_config
   - _self_
 
 hydra:

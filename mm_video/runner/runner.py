@@ -25,7 +25,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["Runner", "main"]
+__all__ = ["Runner"]
 
 
 @runner_store
@@ -103,10 +103,3 @@ class Runner:
         )
 
         trainer.run()
-
-
-@hydra.main(version_base=None, config_name="config",
-            config_path=f"{os.path.dirname(os.path.abspath(__file__))}/../../configs")
-def main(cfg: BaseConfig):
-    runner = instantiate(cfg.runner)
-    runner.run(cfg)

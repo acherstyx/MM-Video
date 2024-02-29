@@ -4,10 +4,9 @@
 # @Project : MM-Video
 # @File    : base_config.py
 
-import hydra
 from hydra.core.config_store import ConfigStore
 
-from omegaconf import OmegaConf, MISSING
+from omegaconf import MISSING
 from dataclasses import dataclass, field
 from typing import List, Any, Optional
 
@@ -59,12 +58,4 @@ class BaseConfig:
     runner: Any = MISSING
 
 
-ConfigStore.instance().store(name="base_config", node=BaseConfig)
-
-if __name__ == "__main__":
-    @hydra.main(version_base=None, config_name="config", config_path="../../configs")
-    def main(cfg: BaseConfig):
-        print(OmegaConf.to_yaml(cfg))
-
-
-    main()
+ConfigStore.instance().store(name="mm_video_structured_config", node=BaseConfig)
