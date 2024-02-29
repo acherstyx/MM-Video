@@ -30,7 +30,7 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-exclude = ["test*", "model_zoo*", "dataset*", "configs*", "scripts*", "tools*"]
+exclude = ["test*", "model_zoo*", "dataset*", "configs*", "scripts*", "tools*", "examples*"]
 
 [tool.whell]
-exclude = ["test*", "model_zoo*", "dataset*", "configs*", "scripts*", "tools*"]
+exclude = ["test*", "model_zoo*", "dataset*", "configs*", "scripts*", "tools*", "examples*"]
