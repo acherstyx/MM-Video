@@ -39,9 +39,9 @@ from mm_video.modeling.meter import Meter
 from mm_video.modeling.optimization import get_linear_schedule_with_warmup
 from mm_video.utils.train_utils import (
     CudaPreFetcher, get_trainable_parameters, compute_total_gradient_norm,
-    get_world_size, get_local_rank, get_master_addr, get_master_port,
     save_rng_state, load_rng_state
 )
+from mm_video.utils.distributed import get_world_size, get_local_rank, get_master_addr, get_master_port
 from mm_video.utils.writer import get_writer
 from mm_video.utils.profile import Timer
 from .trainer_utils import barrier, get_module_class_from_name, load_state_dict, unwrap_model, get_write_freq
@@ -157,6 +157,10 @@ class DebugConfig:
     save_inputs: bool = False
     save_inputs_for_each_step: bool = False
 
+    max_train_steps: int = 10
+    max_test_steps: int = 10
+    max_eval_steps: int = 10
+
 
 @dataclass
 class TrainerState:
@@ -185,9 +189,10 @@ class Trainer:
     def __init__(
             self,
             datasets: Dict[str, data.Dataset], model: nn.Module, meter: Meter,
-            do_train: bool = False, do_test: bool = False, do_eval: bool = False,
-            output_dir: str = "${hydra:runtime.output_dir}",
             optimizer: Optional[optim.Optimizer] = None, scheduler: Optional[optim.lr_scheduler.LRScheduler] = None,
+            # Configs
+            output_dir: str = "${hydra:runtime.output_dir}",
+            do_train: bool = False, do_test: bool = False, do_eval: bool = False,
             training: TrainingConfig = TrainingConfig(),
             dataloader: DataLoaderConfig = DataLoaderConfig(),
             training_strategy: TrainingStrategyConfig = TrainingStrategyConfig(),
@@ -565,10 +570,10 @@ class Trainer:
         loss_meta_total = defaultdict(float)
 
         logger.debug("Running train epoch for-loop...")
-        for cur_step, inputs in enumerate(train_dataloader):
+        for train_step, inputs in enumerate(train_dataloader):
             if self.state.skip_step > 0:
                 progress_bar.set_postfix({"Skip for resume": f"{self.state.skip_step} steps left"})
-                if cur_step % self.training_cfg.gradient_accumulation_steps == 0:
+                if train_step % self.training_cfg.gradient_accumulation_steps == 0:
                     progress_bar.update()
                     self.state.skip_step -= 1
                 if self.state.skip_step == 0:
@@ -596,16 +601,16 @@ class Trainer:
 
             if self.training_cfg.gradient_accumulation_steps > 1:
                 progress_bar.set_postfix({
-                    "Accumulation Steps": (cur_step + 1) % self.training_cfg.gradient_accumulation_steps
+                    "Accumulation Steps": (train_step + 1) % self.training_cfg.gradient_accumulation_steps
                 })
-            if (cur_step + 1) % self.training_cfg.gradient_accumulation_steps == 0:
+            if (train_step + 1) % self.training_cfg.gradient_accumulation_steps == 0:
                 # summary
                 with torch.no_grad():
-                    if (cur_step + 1) % get_write_freq(self.training_cfg.write_histogram) == 0:
+                    if (train_step + 1) % get_write_freq(self.training_cfg.write_histogram) == 0:
                         self._write_histogram()
-                    if (cur_step + 1) % get_write_freq(self.training_cfg.write_gradient_norm) == 0:
+                    if (train_step + 1) % get_write_freq(self.training_cfg.write_gradient_norm) == 0:
                         self._write_total_gradient_norm()
-                    if (cur_step + 1) % get_write_freq(self.training_cfg.write_loss_and_learning_rate) == 0:
+                    if (train_step + 1) % get_write_freq(self.training_cfg.write_loss_and_learning_rate) == 0:
                         # noinspection PyTypeChecker
                         self._write_loss_and_learning_rate(loss=loss_total, loss_meta=loss_meta_total)
                     self.meter.update(
@@ -645,8 +650,9 @@ class Trainer:
                     self._save_checkpoint()
 
             # Exit if debug
-            if self.debug_cfg.enable and cur_step + 1 >= 100 * self.training_cfg.gradient_accumulation_steps:
-                logger.warning("Debug mode is enabled, only run for 100 step.")
+            if (self.debug_cfg.enable and
+                    train_step + 1 >= self.debug_cfg.max_train_steps * self.training_cfg.gradient_accumulation_steps):
+                logger.warning("Debug mode is enabled, only run for %s step.", self.debug_cfg.max_train_steps)
                 break
 
         logger.debug("Train epoch for-loop finished.")
@@ -718,7 +724,7 @@ class Trainer:
         progress_bar = tqdm(desc=f"Test on epoch {self.state.epoch + 1}", dynamic_ncols=True, total=len(dataloader),
                             disable=not self.should_write)
 
-        for inputs in dataloader:
+        for test_step, inputs in enumerate(dataloader):
             model.eval()
             outputs = self.model(inputs)
             self.meter.update(
@@ -726,6 +732,10 @@ class Trainer:
                 writer=self.writer, main_tag="test", global_step=self.state.epoch
             )
             progress_bar.update()
+            # Exit if debug
+            if self.debug_cfg.enable and test_step + 1 >= self.debug_cfg.max_test_steps:
+                logger.warning("Debug mode is enabled, only run for %s step.", self.debug_cfg.max_test_steps)
+                break
 
     def _after_test_epoch(self):
         # write metric and reset meter
@@ -754,7 +764,7 @@ class Trainer:
         process_bar = tqdm(desc="Evaluation", dynamic_ncols=True, total=len(dataloader),
                            disable=not self.should_write)
 
-        for inputs in dataloader:
+        for eval_step, inputs in enumerate(dataloader):
             model.eval()
             outputs = self.model(inputs)
             self.meter.update(
@@ -762,6 +772,10 @@ class Trainer:
                 writer=self.writer, main_tag="eval", global_step=self.state.epoch
             )
             process_bar.update()
+            # Exit if debug
+            if self.debug_cfg.enable and eval_step + 1 >= self.debug_cfg.max_eval_steps:
+                logger.warning("Debug mode is enabled, only run for %s step.", self.debug_cfg.max_eval_steps)
+                break
 
     def _after_eval(self):
         self.meter.summary(writer=self.writer, main_tag="eval", global_step=self.state.epoch)

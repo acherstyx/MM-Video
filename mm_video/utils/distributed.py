@@ -3,6 +3,7 @@
 # @Author  : Yaojie Shen
 # @Project : MM-Video
 # @File    : distributed.py
+
 import os
 import torch
 import pickle
@@ -10,7 +11,6 @@ import hashlib
 import itertools
 import time
 import torch.distributed as dist
-from dataclasses import dataclass
 import logging
 from typing import *
 
@@ -56,17 +56,27 @@ def get_master_port() -> Union[int, None]:
         return None
 
 
-def gather_object_multiple_gpus(list_object: List[Any], backend: AnyStr = "nccl", shared_folder=None,
-                                retry=600, sleep=0.1):
+def gather_object_multiple_gpus(
+        list_of_objects: List[Any],
+        backend: AnyStr = "nccl", shared_folder=None, retry=600, sleep=0.1
+) -> List[Any]:
     """
-    gather a list of something from multiple GPU
+    Gathers a list of objects from all ranks and chains them into a single list.
+    This function must be called on all ranks due to the collective communications.
+
+    :param list_of_objects: Variable length list of objects to gather.
+    :param backend: The backend to use for gathering. Defaults to "nccl".
+    :param shared_folder: The folder to use for gathering if backend is "filesystem".
+    :param retry: Number of retries in case of failures. Defaults to 600.
+    :param sleep: Sleep time between retries. Defaults to 0.1.
+    :return: A list of gathered objects.
     """
-    assert type(list_object) == list, "`list_object` only receive list."
+    assert type(list_of_objects) is list, "`list_of_objects` only receive list."
     assert backend in ["nccl", "filesystem"]
     if backend == "nccl":
         gathered_objects = [None for _ in range(dist.get_world_size())]
         logger.debug("Gathering with `all_gather_object`, please check if programme hanging...")
-        dist.all_gather_object(gathered_objects, list_object)
+        dist.all_gather_object(gathered_objects, list_of_objects)
         return list(itertools.chain(*gathered_objects))
     else:
         assert shared_folder is not None, "`share_folder` should be set if backend is `filesystem`"
@@ -75,7 +85,7 @@ def gather_object_multiple_gpus(list_object: List[Any], backend: AnyStr = "nccl"
         dist.all_reduce(uuid)
         uuid = hex(uuid.cpu().item())[-8:]
         with open(os.path.join(shared_folder, f"{uuid}_rank_{dist.get_rank():04d}.pkl"), "wb") as f:
-            data = pickle.dumps(list_object)
+            data = pickle.dumps(list_of_objects)
             f.write(data)
         with open(os.path.join(shared_folder, f"{uuid}_rank_{dist.get_rank():04d}.md5"), "wb") as f:
             checksum = hashlib.md5(data).hexdigest()
@@ -105,16 +115,35 @@ def gather_object_multiple_gpus(list_object: List[Any], backend: AnyStr = "nccl"
 
 
 def conditional_gather_object_multiple_gpus(
-        list_object: List[Any],
+        list_of_objects: List[Any],
         backend: AnyStr = "nccl", shared_folder=None, retry=600, sleep=0.1
-):
+) -> List[Any]:
+    """
+    Conditionally gather list of objects from all ranks and chains them into a single list if distributed
+    environment is initialized, otherwise return the original list of objects.
+
+    :param list_of_objects: Variable length list of objects to gather.
+    :param backend: The backend to use for gathering. Defaults to "nccl".
+    :param shared_folder: The folder to use for gathering if backend is "filesystem".
+    :param retry: Number of retries in case of failures. Defaults to 600.
+    :param sleep: Sleep time between retries. Defaults to 0.1.
+    :return: A list of gathered objects.
+    """
     if dist.is_initialized():
         return gather_object_multiple_gpus(
-            list_object=list_object,
+            list_of_objects,
             backend=backend,
             shared_folder=shared_folder,
             retry=retry,
             sleep=sleep
         )
     else:
-        return list_object
+        return list_of_objects
+
+
+def batch_gather_object_multiple_gpus(*list_of_objects: List[Any], **kwargs) -> List[List[Any]]:
+    return [gather_object_multiple_gpus(x, **kwargs) for x in list_of_objects]
+
+
+def batch_conditional_gather_object_multiple_gpus(*list_of_objects: List[Any], **kwargs) -> List[List[Any]]:
+    return [conditional_gather_object_multiple_gpus(x, **kwargs) for x in list_of_objects]
