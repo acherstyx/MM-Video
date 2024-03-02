@@ -126,7 +126,7 @@ class TrainingConfig:
     # Resume model from pretrained parameters
     resume: Optional[str] = None
     # Resume from last checkpoint saved in output directory
-    resume_from_checkpoint: bool = False
+    resume_from_checkpoint: Union[bool, str] = False
 
     detect_anomaly: bool = False
 
@@ -164,7 +164,9 @@ class DebugConfig:
 
 @dataclass
 class TrainerState:
+    # Current training epoch
     epoch: int = 0
+    # Current training step
     global_step: int = 0
     skip_step: int = 0
     resume_checkpoint: str = None
@@ -241,10 +243,8 @@ class Trainer:
 
     def create_scheduler(self, optimizer: optim.Optimizer):
         logger.debug("Creating scheduler...")
-        max_train_steps = math.ceil(
-            len(self.dataloader["train"]) * self.training_cfg.num_train_epochs /
-            self.training_cfg.gradient_accumulation_steps
-        )
+        max_train_steps = (len(self.dataloader["train"]) * self.training_cfg.num_train_epochs //
+                           self.training_cfg.gradient_accumulation_steps)
         warmup_steps = 0
         assert (self.training_cfg.warmup_ratio is None) or (self.training_cfg.warmup_steps is None), \
             "Both warmup_ratio and warmup_steps should not be set simultaneously."
@@ -335,6 +335,7 @@ class Trainer:
             self.state = TrainerState.load_from_json(trainer_state_file)
             # Skip the steps from the previous run
             self.state.skip_step = self.state.global_step
+            self.state.epoch = 0
             self.state.resume_checkpoint = checkpoint
 
         logger.info("Resume from step %s", self.state.global_step)
@@ -500,7 +501,10 @@ class Trainer:
 
         # Resume from last checkpoint
         if self.training_cfg.resume_from_checkpoint:
-            checkpoint_folder = self._get_last_checkpoint()
+            if type(self.training_cfg.resume_from_checkpoint) is str:
+                checkpoint_folder = self.training_cfg.resume_from_checkpoint
+            else:
+                checkpoint_folder = self._get_last_checkpoint()
             if checkpoint_folder is not None:
                 logger.info("Resuming from the last checkpoint: %s", checkpoint_folder)
                 self._load_checkpoint(checkpoint_folder)
@@ -604,7 +608,7 @@ class Trainer:
                     "Accumulation Steps": (train_step + 1) % self.training_cfg.gradient_accumulation_steps
                 })
             if (train_step + 1) % self.training_cfg.gradient_accumulation_steps == 0:
-                # summary
+                # Summary
                 with torch.no_grad():
                     if (train_step + 1) % get_write_freq(self.training_cfg.write_histogram) == 0:
                         self._write_histogram()
