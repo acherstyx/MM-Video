@@ -38,7 +38,7 @@ class Meter(ABC):
         """
 
     @abstractmethod
-    def summary(self, writer: Optional[SummaryWriter], main_tag: str, global_step: int) -> Optional[float]:
+    def summary(self, writer: Optional[SummaryWriter], main_tag: str, global_step: int) -> Optional[Dict[str, float]]:
         """call at the end of the train/test/val epoch.
         return a dict of summarized metrics of current epoch, which will be written to the tensorboard."""
 

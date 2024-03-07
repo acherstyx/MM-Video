@@ -36,11 +36,25 @@ class Runner:
 
     """
 
-    def __init__(self, dataset_splits: List[str] = ("train", "test", "eval")):
-        self.dataset_splits = dataset_splits
+    def __init__(self, do_train: bool, do_test: bool, do_eval: bool):
+        self.do_train = do_train
+        self.do_test = do_test
+        self.do_eval = do_eval
+        # TODO: Add an option to load model state dict after build
 
     @staticmethod
-    def build_dataset(dataset_config: DictConfig, dataset_splits: List[str]) -> Dict[str, Dataset]:
+    def build_dataset(
+            dataset_config: DictConfig,
+            with_train: bool = True, with_test: bool = True, with_eval: bool = True
+    ) -> Dict[str, Dataset]:
+        dataset_splits = []
+        if with_train:
+            dataset_splits.append("train")
+        if with_test:
+            dataset_splits.append("test")
+        if with_eval:
+            dataset_splits.append("eval")
+
         def is_target(x: Any) -> bool:
             if isinstance(x, dict):
                 return "_target_" in x
@@ -80,26 +94,26 @@ class Runner:
             meter = DummyMeter()
         return meter
 
-    @staticmethod
-    def save_code():
-        mm_video_root = mm_video.__path__[0]
-        assert os.path.exists(mm_video.__path__[0])
-        shutil.make_archive(base_name=os.path.join(HydraConfig.get().runtime.output_dir, "code"), format="zip",
-                            root_dir=os.path.dirname(mm_video_root), base_dir=os.path.basename(mm_video_root))
-
     def run(self, cfg: BaseConfig):
         if cfg.system.deterministic:
             manual_seed(cfg.system.seed)
 
-        self.save_code()
-        dataset = self.build_dataset(cfg.dataset, self.dataset_splits)
+        dataset = self.build_dataset(
+            dataset_config=cfg.dataset,
+            with_train=self.do_train,
+            with_test=self.do_train and self.do_test,
+            with_eval=self.do_eval,
+        )
         model = self.build_model(cfg.model)
         meter = self.build_meter(cfg.meter)
 
         trainer = instantiate(cfg.trainer)(
-            datasets=dataset,
+            train_dataset=dataset["train"] if self.do_train else None,
+            eval_dataset=dataset["test"] if self.do_train and self.do_test else None,
             model=model,
             meter=meter
         )
 
-        trainer.run()
+        trainer.train()
+        if self.do_eval:
+            trainer.evaluate(dataset["eval"])

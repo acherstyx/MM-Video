@@ -17,15 +17,18 @@ dataset:
     split: eval
 
 trainer:
-  do_train: True
-  do_test: True
-  do_eval: True
-
   training:
     num_train_epochs: 5
-    resume_from_checkpoint: True
     save_steps: 1000
+    eval_steps: 500
+    logging_steps: 1
 
   dataloader:
     num_workers: 8
-    batch_size: 16
+    train_batch_size: 16
+    eval_batch_size: 16
+
+runner:
+  do_train: True
+  do_test: True
+  do_eval: True

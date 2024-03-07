@@ -16,6 +16,8 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import FullyShardedDataParallel
 
+from mm_video.utils.distributed import get_rank, get_world_size
+
 logger = logging.getLogger(__name__)
 
 
@@ -220,6 +222,7 @@ def save_rng_state(output_dir):
 
 def load_rng_state(checkpoint):
     if checkpoint is None:
+        logger.warning("Checkpoint is None while loading rng_state.", stacklevel=2)
         return
 
     if get_world_size() <= 1:
@@ -255,51 +258,3 @@ def load_rng_state(checkpoint):
                     f"Didn't manage to set back the RNG states of the GPU because of the following error:\n {e}"
                     "\nThis won't yield the same results as if the training had not been interrupted."
                 )
-
-
-def get_rank() -> int:
-    """
-    Get (global) rank from environment variable set by `torchrun`.
-    """
-    warnings.warn("get_rank is deprecated and will be moved to mm_video.utils.distributed",
-                  DeprecationWarning, stacklevel=2)
-    from .distributed import get_rank
-    return get_rank()
-
-
-def get_world_size() -> int:
-    """
-    Get (global) world size from environment variable set by `torchrun`.
-    """
-    warnings.warn("get_world_size is deprecated and will be moved to mm_video.utils.distributed",
-                  DeprecationWarning, stacklevel=2)
-    from .distributed import get_world_size
-    return get_world_size()
-
-
-def get_local_rank() -> int:
-    warnings.warn("get_local_rank is deprecated and will be moved to mm_video.utils.distributed",
-                  DeprecationWarning, stacklevel=2)
-    from .distributed import get_local_rank
-    return get_local_rank()
-
-
-def get_local_world_size() -> int:
-    warnings.warn("get_local_world_size is deprecated and will be moved to mm_video.utils.distributed",
-                  DeprecationWarning, stacklevel=2)
-    from .distributed import get_local_world_size
-    return get_local_world_size()
-
-
-def get_master_addr() -> str:
-    warnings.warn("get_master_addr is deprecated and will be moved to mm_video.utils.distributed",
-                  DeprecationWarning, stacklevel=2)
-    from .distributed import get_master_addr
-    return get_master_addr()
-
-
-def get_master_port() -> Union[int, None]:
-    warnings.warn("get_master_port is deprecated and will be moved to mm_video.utils.distributed",
-                  DeprecationWarning, stacklevel=2)
-    from .distributed import get_master_port
-    return get_master_port()

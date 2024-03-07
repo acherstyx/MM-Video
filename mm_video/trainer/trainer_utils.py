@@ -90,12 +90,15 @@ def save_state_dict(model: nn.Module, model_file: str):
 
 
 def manual_seed(seed):
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
     logger.info("Manual seed is set to %s", seed)
 
 
@@ -108,3 +111,14 @@ def get_write_freq(x: Optional[int]):
     """
     assert x is None or type(x) is int
     return float("inf") if x is None else x
+
+
+def has_length(dataset):
+    """
+    Checks if the dataset implements __len__() and it doesn't raise an error
+    """
+    try:
+        return len(dataset) is not None
+    except TypeError:
+        # TypeError: len() of unsized object
+        return False
