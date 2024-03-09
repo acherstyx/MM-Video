@@ -332,41 +332,6 @@ class Trainer:
         else:
             logger.debug("No previous checkpoint found in the output directory.")
 
-    @staticmethod
-    def build_loader(datasets: Dict[str, data.Dataset], cfg: DataLoaderConfig):
-        assert all(split in ("train", "test", "eval") for split in datasets.keys()), \
-            f"Invalid split found in {datasets.keys()}. Must be one of 'train', 'test', or 'eval'."
-        timer = Timer(msg="Building dataloader...")
-        world_size = get_world_size()
-        loader_and_sampler = {}
-        for split, dataset in datasets.items():
-            shuffle = cfg.shuffle if split == "train" else False
-            batch_size = getattr(cfg, f"{split}_batch_size")
-            if batch_size is None:
-                batch_size = getattr(cfg, "batch_size")
-            collate_fn = get_object(cfg.collate_fn) if cfg.collate_fn is not None else None
-
-            sampler = data.distributed.DistributedSampler(dataset, shuffle=shuffle) if world_size > 1 else None
-
-            loader = data.DataLoader(
-                dataset,
-                batch_size=batch_size,
-                shuffle=False if world_size > 1 else shuffle,
-                sampler=sampler,
-                num_workers=cfg.num_workers,
-                collate_fn=collate_fn,
-                pin_memory=cfg.pin_memory,
-                persistent_workers=False,
-                prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
-                multiprocessing_context=cfg.multiprocessing_context if cfg.num_workers else None
-            )
-
-            loader_and_sampler[split] = loader
-            if sampler is not None:
-                loader_and_sampler[f"{split}_sampler"] = sampler
-        timer.end()
-        return loader_and_sampler
-
     def _wrap_model(self, model: nn.Module, training: bool = True):
         cfg = self.training_strategy_cfg
 
@@ -574,14 +539,30 @@ class Trainer:
 
         # Skip the fist epochs_trained epochs to get the random state of the dataloader at the right point
         skip_global_step = 0
+        skip_epoch = 0.0
         for epoch in range(epochs_trained):
+            steps_in_epoch = (
+                len(train_dataloader) if len_dataloader is not None
+                else max_steps * gradient_accumulation_steps
+            )
             iter(train_dataloader)
-            for step in range(len(train_dataloader)):
+            for step in tqdm(range(len(train_dataloader)), desc=f"Train (Skipping): {epoch}/{epochs_trained}"):
                 if step % gradient_accumulation_steps == 0:
                     skip_global_step += 1
-                    if self.state.should_evaluate_step(skip_global_step):
+                    skip_epoch = epoch + (step + 1) / steps_in_epoch
+                    if (
+                            self.state.should_evaluate_step(skip_global_step)
+                            or
+                            self.state.should_evaluate_epoch(skip_epoch)
+                    ):
+                        logger.debug("Iter eval dataloader")
                         iter(self.get_eval_dataloader())
-            if self.state.should_evaluate_epoch(epoch):
+            if (
+                    self.state.should_evaluate_step(skip_global_step)
+                    or
+                    self.state.should_evaluate_epoch(skip_epoch)
+            ):
+                logger.debug("Iter eval dataloader")
                 iter(self.get_eval_dataloader())
 
         for epoch in range(epochs_trained, num_train_epochs):
@@ -639,7 +620,13 @@ class Trainer:
                         progress_bar.update()  # TODO: Use a dedicate progress bar for skipping
                         steps_trained_in_current_epoch -= 1
                         skip_global_step += 1
-                        if self.state.should_evaluate_step(skip_global_step):
+                        skip_epoch = epoch + (step + 1) / steps_in_epoch
+                        if (
+                                self.state.should_evaluate_step(skip_global_step)
+                                or
+                                self.state.should_evaluate_epoch(skip_epoch)
+                        ):
+                            logger.debug("Iter eval dataloader")
                             iter(self.get_eval_dataloader())
                     if steps_trained_in_current_epoch == 0:
                         logger.debug("Resuming random status from checkpoint at: %s", resume_from_checkpoint)
@@ -730,9 +717,6 @@ class Trainer:
             # save checkpoint
             self._maybe_log_save_evaluate(None, None, writer, loss_total, loss_meta_total, model, epoch_end=True)
 
-            if self.state.should_evaluate_epoch():
-                self.evaluate()
-
         state_dict = self.model_wrapped.state_dict()
         if self.should_write:
             self.save_model(state_dict=state_dict)
@@ -797,7 +781,7 @@ class Trainer:
                 logger.warning("Debug mode is enabled, only run for %s step.", self.debug_cfg.max_test_steps)
                 break
         # write metric and reset meter
-        metrics = self.meter.summary(writer=writer, main_tag="test", global_step=int(self.state.epoch))
+        metrics = self.meter.summary(writer=writer, main_tag="test", global_step=self.state.global_step)
         # Replace None return with an empty dict
         metrics = {} if metrics is None else metrics
         self.meter.reset()
@@ -809,7 +793,6 @@ class Trainer:
 
         return metrics
 
-    @torch.no_grad()
     def evaluate(
             self,
             eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,

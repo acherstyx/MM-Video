@@ -36,7 +36,7 @@ class Runner:
 
     """
 
-    def __init__(self, do_train: bool, do_test: bool, do_eval: bool):
+    def __init__(self, do_train: bool = False, do_test: bool = False, do_eval: bool = False):
         self.do_train = do_train
         self.do_test = do_test
         self.do_eval = do_eval
