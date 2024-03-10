@@ -18,7 +18,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "get_rank", "get_world_size", "get_local_rank", "get_local_world_size", "get_master_addr", "get_master_port",
-    "gather_object_multiple_gpus", "conditional_gather_object_multiple_gpus"
+    "gather_object_multiple_gpus", "conditional_gather_object_multiple_gpus",
+    "batch_gather_object_multiple_gpus", "batch_conditional_gather_object_multiple_gpus"
 ]
 
 
