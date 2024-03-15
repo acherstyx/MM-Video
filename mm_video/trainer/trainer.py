@@ -7,6 +7,7 @@ import glob
 import math
 import os
 import re
+import copy
 
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -36,7 +37,7 @@ import contextlib
 from functools import partial
 
 from mm_video.config import trainer_store
-from mm_video.modeling.meter import Meter
+from mm_video.modeling.meter import Meter, DummyMeter, GroupMeter
 from mm_video.modeling.optimization import get_linear_schedule_with_warmup
 from mm_video.utils.train_utils import (
     CudaPreFetcher, get_trainable_parameters, compute_total_gradient_norm,
@@ -45,6 +46,7 @@ from mm_video.utils.train_utils import (
 from mm_video.utils.distributed import get_world_size, get_local_rank, get_master_addr, get_master_port, get_rank
 from mm_video.utils.writer import get_writer
 from mm_video.utils.profile import Timer
+
 from .trainer_utils import barrier, get_module_class_from_name, load_state_dict, unwrap_model, get_write_freq, \
     has_length
 from .training_configs import TrainingConfig, DebugConfig, TrainingStrategyConfig, TrainingStrategy, DataLoaderConfig
@@ -129,7 +131,8 @@ class TrainerState:
 class Trainer:
     def __init__(
             self,
-            model: nn.Module, meter: Meter,
+            model: nn.Module = None,
+            meter: Optional[Union[Meter, Dict[str, Meter]]] = None,
             train_dataset: Optional[Dataset] = None, eval_dataset: Optional[Dataset] = None,
             optimizer: Optional[optim.Optimizer] = None, scheduler: Optional[optim.lr_scheduler.LRScheduler] = None,
             # Configs
@@ -159,6 +162,16 @@ class Trainer:
             dist.init_process_group(backend="nccl")
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))  # get RANK from environment
 
+        if meter is None:
+            self.train_meter = DummyMeter()
+        elif type(meter) is dict:
+            self.train_meter = GroupMeter(meter)
+        else:
+            self.train_meter = meter
+        # Copy a separate meter for evaluation.
+        # TODO: Deepcopy may fail, how to avoid that?
+        self.eval_meter = copy.deepcopy(self.train_meter)
+
         self.dataset = None
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
@@ -166,7 +179,7 @@ class Trainer:
 
         self.optimizer = optimizer
         self.scheduler = scheduler
-        self.meter: Meter = meter  # TODO: Support a list of meters
+
         self.scaler: GradScaler = GradScaler() if self.training_cfg.amp else None
 
         self.state = TrainerState(
@@ -482,7 +495,9 @@ class Trainer:
             # TODO: Support 'max_steps' option
             raise NotImplementedError("Dataset do not have a length, not supported.")
 
+        # Get parameter information before wrap
         trainable_params, all_param, trainable_params_names = get_trainable_parameters(self.model)
+        all_params_names = [p for p, _ in self.model.named_parameters()]
 
         # Wrap model before training
         model = self._wrap_model(self.model)
@@ -530,8 +545,7 @@ class Trainer:
         logger.info(f"  Number of trainable parameters = {trainable_params:,}")
         logger.info(f"  Trainable percentage = {100 * trainable_params / all_param:,}")
         logger.debug("Full list of parameters (* indicates frozen parameters):\n\t%s",
-                     '\n\t'.join([(p if p in trainable_params_names else f"{p} *")
-                                  for p, _ in self.model.named_parameters()]))
+                     '\n\t'.join([(p if p in trainable_params_names else f"{p} *") for p in all_params_names]))
         logger.info("****************************")
 
         self.optimizer.zero_grad()
@@ -712,8 +726,8 @@ class Trainer:
             self.model.zero_grad()
             self.optimizer.zero_grad()
             # write metric and reset meter
-            self.meter.summary(writer=writer, main_tag="train", global_step=self.state.global_step)
-            self.meter.reset()
+            self.train_meter.summary(writer=writer, main_tag="train", global_step=self.state.global_step)
+            self.train_meter.reset()
             # save checkpoint
             self._maybe_log_save_evaluate(None, None, writer, loss_total, loss_meta_total, model, epoch_end=True)
 
@@ -729,7 +743,7 @@ class Trainer:
 
         # Update meter after each train step
         if not epoch_end:
-            self.meter.update(
+            self.train_meter.update(
                 inputs=inputs, outputs=outputs,
                 writer=writer, main_tag="train", global_step=self.state.global_step
             )
@@ -768,7 +782,7 @@ class Trainer:
         )
         for step, inputs in enumerate(dataloader):
             outputs = self.prediction_step(model, inputs)
-            self.meter.update(
+            self.eval_meter.update(
                 inputs=inputs,
                 outputs=outputs,
                 writer=writer,
@@ -781,10 +795,10 @@ class Trainer:
                 logger.warning("Debug mode is enabled, only run for %s step.", self.debug_cfg.max_test_steps)
                 break
         # write metric and reset meter
-        metrics = self.meter.summary(writer=writer, main_tag="test", global_step=self.state.global_step)
+        metrics = self.eval_meter.summary(writer=writer, main_tag="test", global_step=self.state.global_step)
         # Replace None return with an empty dict
         metrics = {} if metrics is None else metrics
-        self.meter.reset()
+        self.eval_meter.reset()
 
         # Prefix all keys with metric_key_prefix + '_'
         for key in list(metrics.keys()):
