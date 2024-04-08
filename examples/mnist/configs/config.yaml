@@ -1,0 +1,34 @@
+defaults:
+  - mm_video
+  - /dataset@dataset.train: MNISTDataset
+  - /dataset@dataset.test: MNISTDataset
+  - /dataset@dataset.eval: MNISTDataset
+  - /model: CNN
+
+log:
+  project_name: mnist_example
+
+dataset:
+  train:
+    split: train
+  test:
+    split: test
+  eval:
+    split: eval
+
+trainer:
+  training:
+    num_train_epochs: 5
+    save_steps: 1000
+    eval_steps: 500
+    logging_steps: 1
+
+  dataloader:
+    num_workers: 8
+    train_batch_size: 16
+    eval_batch_size: 16
+
+runner:
+  do_train: True
+  do_test: True
+  do_eval: True

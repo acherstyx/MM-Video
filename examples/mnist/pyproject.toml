@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0", "packaging"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mnist-example"
+version = "0.1.0"
+description = "MNIST example"
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+]
+dependencies = [
+    # Base framework
+    "mm-video@git+https://github.com/acherstyx/MM-Video@develop"
+]
+
+[tool.setuptools.packages.find]
+exclude = ["test*", "model_zoo*", "dataset*", "configs*", "scripts*", "tools*"]
+
+[tool.whell]
+exclude = ["test*", "model_zoo*", "dataset*", "configs*", "scripts*", "tools*"]

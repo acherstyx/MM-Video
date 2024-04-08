@@ -1,0 +1,8 @@
+# @package _global_
+
+log:
+  experiment_name: run_fsdp
+
+trainer:
+  training_strategy:
+    strategy: fsdp
