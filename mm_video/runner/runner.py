@@ -3,22 +3,16 @@
 # @Author  : Yaojie Shen
 # @Project : MM-Video
 # @File    : runner.py
-
-import hydra
 from hydra.utils import instantiate
-from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from typing import *
 
-import os
-import shutil
 from torch.nn import Module
 from torch.utils.data import Dataset
 
-import mm_video
 from mm_video.trainer.trainer_utils import manual_seed
 from mm_video.config import BaseConfig, runner_store
-from mm_video.modeling.meter import Meter, DummyMeter
+from mm_video.modeling.meter import Meter
 from mm_video.utils.profile import Timer
 
 import logging
@@ -26,6 +20,14 @@ import logging
 logger = logging.getLogger(__name__)
 
 __all__ = ["Runner"]
+
+
+def is_target(x: Any) -> bool:
+    if isinstance(x, dict):
+        return "_target_" in x
+    if OmegaConf.is_dict(x):
+        return "_target_" in x
+    return False
 
 
 @runner_store
@@ -55,18 +57,15 @@ class Runner:
         if with_eval:
             dataset_splits.append("eval")
 
-        def is_target(x: Any) -> bool:
-            if isinstance(x, dict):
-                return "_target_" in x
-            if OmegaConf.is_dict(x):
-                return "_target_" in x
-            return False
-
         if is_target(dataset_config):
             with Timer("Building dataset from the configuration..."):
                 dataset = {split: instantiate(dataset_config, split=split) for split in dataset_splits}
         elif (all(k in ("train", "test", "eval") for k in dataset_config.keys()) and
               all(is_target(v) or v is None for k, v in dataset_config.items())):
+            for required_split in dataset_splits:
+                if required_split not in dataset_config.keys():
+                    raise ValueError(f"{required_split.capitalize()} is enabled while dataset is not provided."
+                                     f"You must specify a dataset in config.")
             # Allow selecting different dataset for train, test and eval
             # See https://stackoverflow.com/a/71371396 for the config syntax
             # Example:
@@ -87,12 +86,15 @@ class Runner:
         return model
 
     @staticmethod
-    def build_meter(meter_config: DictConfig) -> Meter:
-        meter = instantiate(meter_config)
-        if meter is None:
-            logger.info("Meter is not specified.")
-            meter = DummyMeter()
-        return meter
+    def build_meter(meter_config: DictConfig) -> Union[Meter, Dict[str, Meter], None]:
+        if meter_config is None:
+            return None
+        elif is_target(meter_config):
+            return instantiate(meter_config)
+        elif all(is_target(v) for _, v in meter_config.items()):
+            return {k: instantiate(v) for k, v in meter_config.items()}
+        else:
+            raise ValueError(f"Meter config is invalid: \n{OmegaConf.to_yaml(meter_config)}")
 
     def run(self, cfg: BaseConfig):
         if cfg.system.deterministic:
@@ -114,6 +116,7 @@ class Runner:
             meter=meter
         )
 
-        trainer.train()
+        if self.do_train:
+            trainer.train()
         if self.do_eval:
             trainer.evaluate(dataset["eval"])

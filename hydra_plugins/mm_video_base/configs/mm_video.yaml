@@ -7,13 +7,13 @@ hydra:
   run:
     dir: "${log.root}/${log.project_name}/${log.experiment_name}"
   sweep:
-    dir: "${log.root}/${log.project_name}/${log.experiment_name}/multirun"
+    dir: "${log.root}/${log.project_name}/${log.experiment_name}"
     subdir: ${hydra.job.override_dirname}
   job_logging:
     version: 1
     formatters:
-      verbose:
-        format: "[%(asctime)s][Rank ${oc.env:RANK}][%(levelname)s] %(name)s %(lineno)d: %(message)s"
+      distributed:
+        format: "[%(asctime)s][Rank ${oc.env:RANK,unset}][%(levelname)s] %(name)s %(lineno)d: %(message)s"
       colorful:
         '()': 'colorlog.ColoredFormatter'
         format: "[%(log_color)s%(levelname)s%(reset)s][%(blue)s%(name)s%(reset)s]: %(message)s"
@@ -30,8 +30,8 @@ hydra:
         formatter: colorful
       file:
         level: DEBUG
-        formatter: verbose
-        filename: "${hydra.runtime.output_dir}/${hydra.job.name}_node_${oc.env:GROUP_RANK}.log"
+        formatter: distributed
+        filename: "${hydra.runtime.output_dir}/${hydra.job.name}_node_${oc.env:GROUP_RANK,unset}.log"
     root:
-      level: DEBUG
+      level: INFO
       handlers: [ file, console ]
