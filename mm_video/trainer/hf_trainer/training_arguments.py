@@ -71,6 +71,11 @@ class HFTrainingArguments(TrainingArguments):
         },
     )
 
+    # Change type to dict to allow configuring and overriding with hydra
+    deepspeed: dict = field(
+        default_factory=dict
+    )
+
 
 # Patch changes of TrainingArguments for each version
 if Version(transformers.__version__) >= Version("4.38.0"):
