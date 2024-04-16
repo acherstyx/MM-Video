@@ -14,7 +14,7 @@ classifiers = [
 ]
 dependencies = [
     # configuration
-    "omegaconf", "hydra-core", "hydra-zen", "colorlog",
+    "omegaconf", "hydra-core>=1.3.2", "hydra-zen", "colorlog",
     # basic
     # deep learning
     "torch>=2.0.0", "torchvision",
