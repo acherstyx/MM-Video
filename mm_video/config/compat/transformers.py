@@ -1,20 +1,22 @@
 # -*- coding: utf-8 -*-
-# @Time    : 2024/3/15
+# @Time    : 4/29/24
 # @Author  : Yaojie Shen
 # @Project : MM-Video
-# @File    : training_arguments.py
+# @File    : transformers.py
 import transformers
+
 from packaging.version import Version
-from transformers import TrainingArguments
 from dataclasses import dataclass, field
-from omegaconf import DictConfig, OmegaConf
-from typing import Optional, Union, List
+from typing import Optional, List
+from omegaconf import MISSING
 
 import logging
 
+from ._common import DelayPostInit
+
 logger = logging.getLogger(__name__)
 
-__all__ = ["HFTrainingArguments", "init_hf_training_args"]
+__all__ = ["TrainingArguments"]
 
 """
 Patching HuggingFace transformers TrainingArguments to make it compatible with Hydra.
@@ -25,14 +27,8 @@ Other versions may also be supported, but not yet verified.
 
 
 @dataclass
-class HFTrainingArguments(TrainingArguments):
-    output_dir: str = "${hydra:runtime.output_dir}"
-    _run_post_init: bool = False
-
-    def __post_init__(self):
-        # Don't run post-init until ready to convert to TrainingArgs
-        if self._run_post_init:
-            super().__post_init__()
+class TrainingArguments(DelayPostInit, transformers.TrainingArguments):
+    output_dir: str = MISSING
 
     # Fix type
     debug: str = field(
@@ -58,7 +54,7 @@ class HFTrainingArguments(TrainingArguments):
         },
     )
     optim: str = field(
-        default=TrainingArguments.default_optim,
+        default=transformers.TrainingArguments.default_optim,
         metadata={"help": "The optimizer to use."},
     )
     neftune_noise_alpha: Optional[float] = field(
@@ -80,7 +76,7 @@ class HFTrainingArguments(TrainingArguments):
 # Patch changes of TrainingArguments for each version
 if Version(transformers.__version__) >= Version("4.38.0"):
     @dataclass
-    class HFTrainingArguments(HFTrainingArguments):
+    class TrainingArguments(TrainingArguments):
         fsdp_config: Optional[str] = field(
             default=None,
             metadata={
@@ -97,14 +93,3 @@ if Version(transformers.__version__) >= Version("4.38.0"):
                         " optimizer at the moment."
             },
         )
-
-
-def init_hf_training_args(training_args: Union[DictConfig, TrainingArguments]) -> TrainingArguments:
-    """
-    Run __post_init__ for HFTrainingArguments.
-    This function should be called before passing it to transformers Trainer.
-    :param training_args:
-    :return:
-    """
-    training_args._run_post_init = True
-    return OmegaConf.to_object(training_args)
