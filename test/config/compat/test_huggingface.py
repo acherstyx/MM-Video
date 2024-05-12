@@ -9,17 +9,18 @@ from omegaconf import OmegaConf
 from rich import print
 import tempfile
 
-from mm_video.config.compat.huggingface import run_post_init
+from mm_video.config.compat import run_post_init
+from mm_video.config.compat.transformers import *
+from mm_video.config.compat.peft import *
 
 
 class TestPEFT(unittest.TestCase):
     def test_peft_config(self):
         cfg = OmegaConf.structured(PeftConfig)
         print(OmegaConf.to_yaml(cfg))
-        print(run_post_init(cfg))
 
     def test_lora_config(self):
-        cfg = OmegaConf.structured(PeftConfig)
+        cfg = OmegaConf.structured(LoraConfig)
         print(OmegaConf.to_yaml(cfg))
         print(run_post_init(cfg))
 
