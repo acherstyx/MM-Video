@@ -4,7 +4,7 @@
 # @Project : MM-Video
 # @File    : _common.py
 from dataclasses import dataclass
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, DictConfig
 
 
 @dataclass
@@ -17,6 +17,13 @@ class DelayPostInit:
             super().__post_init__()
 
 
-def run_post_init(config: DelayPostInit):
-    config._run_post_init = True
-    return OmegaConf.to_object(config)
+def run_post_init(config: DictConfig):
+    if OmegaConf.is_config(config) and hasattr(config, "_run_post_init"):
+        config._run_post_init = True
+        return OmegaConf.to_object(config)
+    elif hasattr(config, "_run_post_init"):
+        config._run_post_init = True
+        config.__post_init__()
+        return config
+    else:
+        return config

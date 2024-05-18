@@ -21,7 +21,7 @@ __all__ = ["TrainingArguments"]
 """
 Patching HuggingFace transformers TrainingArguments to make it compatible with Hydra.
 
-Currently, this patch is verified to be compatible with `transformers>=4.37.0,<=4.39.0`.
+Currently, this patch is verified to be compatible with `transformers>=4.37.0,<=4.41.0`.
 Other versions may also be supported, but not yet verified.
 """
 
@@ -92,4 +92,40 @@ if Version(transformers.__version__) >= Version("4.38.0"):
                 "help": "Target modules for the optimizer defined in the `optim` argument. Only used for the GaLore"
                         " optimizer at the moment."
             },
+        )
+
+if Version(transformers.__version__) >= Version("4.41.0"):
+    @dataclass
+    class TrainingArguments(TrainingArguments):
+        lr_scheduler_kwargs: dict = field(
+            default_factory=dict,
+            metadata={
+                "help": (
+                    "Extra parameters for the lr_scheduler such as {'num_cycles': 1} for the cosine with hard restarts."
+                )
+            },
+        )
+        accelerator_config: Optional[dict] = field(
+            default=None,
+            metadata={
+                "help": (
+                    "Config to be used with the internal Accelerator object initializtion. The value is either a "
+                    "accelerator json config file (e.g., `accelerator_config.json`) or an already loaded json file as "
+                    "`dict`."
+                )
+            },
+        )
+        report_to: Optional[List[str]] = field(
+            default=None, metadata={"help": "The list of integrations to report the results and logs to."}
+        )
+        gradient_checkpointing_kwargs: Optional[dict] = field(
+            default=None,
+            metadata={
+                "help": "Gradient checkpointing key word arguments such as `use_reentrant`. Will be passed to "
+                        "`torch.utils.checkpoint.checkpoint` through `model.gradient_checkpointing_enable`."
+            },
+        )
+        evaluation_strategy: Optional[str] = field(
+            default=None,
+            metadata={"help": "Deprecated. Use `eval_strategy` instead"},
         )
