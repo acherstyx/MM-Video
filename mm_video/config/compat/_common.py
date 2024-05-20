@@ -5,6 +5,7 @@
 # @File    : _common.py
 from dataclasses import dataclass
 from omegaconf import OmegaConf, DictConfig
+from typing import Union, Any
 
 
 @dataclass
@@ -17,7 +18,7 @@ class DelayPostInit:
             super().__post_init__()
 
 
-def run_post_init(config: DictConfig):
+def run_post_init(config: Union[DictConfig, Any]):
     if OmegaConf.is_config(config) and hasattr(config, "_run_post_init"):
         config._run_post_init = True
         return OmegaConf.to_object(config)
