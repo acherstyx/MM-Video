@@ -30,6 +30,11 @@ dependencies = [
     "xopen"
 ]
 
+[project.optional-dependencies]
+# These optional dependencies use the tested versions. Other versions might be supported but are not tested.
+compat_transformers = ["transformers>=4.37.0,<4.42.0"]
+compat_peft = ["peft==0.10.0"]
+
 [tool.setuptools.packages.find]
 exclude = ["test*", "model_zoo*", "dataset*", "configs*", "scripts*", "tools*", "examples*"]
 

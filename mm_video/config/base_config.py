@@ -27,22 +27,13 @@ class SystemConfig:
 @dataclass
 class LogConfig:
     # info/metadata
-
-    root: str = "log"  # log root
+    root: str = "log"
     project_name: str = "unnamed_project"  # this should be set to determine the output directory
     experiment_name: str = "unnamed_experiment"  # this should be set to determine the output directory
 
 
 @dataclass
 class BaseConfig:
-    defaults: List[Any] = field(
-        default_factory=lambda: [
-            "_self_",
-            {"trainer": "Trainer"},
-            {"runner": "Runner"}
-        ]
-    )
-
     # Basic information configuration
     system: SystemConfig = field(default_factory=SystemConfig)
     log: LogConfig = field(default_factory=LogConfig)
