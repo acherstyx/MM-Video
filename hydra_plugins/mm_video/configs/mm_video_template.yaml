@@ -1,5 +1,3 @@
-# @package _global_
-
 defaults:
   - _mm_video_template
   - _self_
