@@ -1,0 +1,12 @@
+# @package _global_
+
+defaults:
+  - _mm_video_template
+  - _self_
+
+hydra:
+  run:
+    dir: "${log.root}/${log.project_name}/${log.experiment_name}"
+  sweep:
+    dir: "${log.root}/${log.project_name}/${log.experiment_name}"
+    subdir: ${hydra.job.override_dirname}

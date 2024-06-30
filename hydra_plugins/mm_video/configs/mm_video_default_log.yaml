@@ -1,0 +1,27 @@
+hydra:
+  job_logging:
+    version: 1
+    formatters:
+      default:
+        format: "[%(asctime)s][%(levelname)s] %(name)s %(lineno)d: %(message)s"
+      colorful:
+        '()': 'colorlog.ColoredFormatter'
+        format: "[%(log_color)s%(levelname)s%(reset)s][%(blue)s%(name)s%(reset)s]: %(message)s"
+        log_colors:
+          DEBUG: purple
+          INFO: green
+          WARNING: yellow
+          ERROR: red
+          CRITICAL: red
+    handlers:
+      console:
+        level: INFO
+        class: logging.StreamHandler
+        formatter: colorful
+      file:
+        level: DEBUG
+        formatter: default
+        filename: "${hydra.runtime.output_dir}/${hydra.job.name}.log"
+    root:
+      level: INFO
+      handlers: [ file, console ]

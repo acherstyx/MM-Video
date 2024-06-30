@@ -4,11 +4,11 @@
 # @Project : MM-Video
 # @File    : base_config.py
 
-from hydra.core.config_store import ConfigStore
-
-from omegaconf import MISSING
 from dataclasses import dataclass, field
-from typing import List, Any, Optional
+from typing import Any, Optional
+
+from hydra.core.config_store import ConfigStore
+from omegaconf import MISSING
 
 """
 Define the structure of base configuration for this template
@@ -49,4 +49,4 @@ class BaseConfig:
     runner: Any = MISSING
 
 
-ConfigStore.instance().store(name="mm_video_structured_config", node=BaseConfig)
+ConfigStore.instance().store(name="_mm_video_template", node=BaseConfig)
