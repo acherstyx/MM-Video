@@ -3,20 +3,20 @@
 # @Author  : Yaojie Shen
 # @Project : MM-Video
 # @File    : train_utils.py
-import os
-import math
 import logging
+import math
+import os
 import random
-import numpy as np
 import warnings
 from typing import *
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import FullyShardedDataParallel
 
-from mm_video.utils.distributed import get_rank, get_world_size
+from mm_video.utils.common.distributed import get_rank, get_world_size
 
 logger = logging.getLogger(__name__)
 
@@ -71,22 +71,6 @@ class CudaPreFetcher:
 
     def __len__(self):
         return len(self.dl)
-
-
-def gather_object_multiple_gpu(*args, **kwargs):
-    from .distributed import gather_object_multiple_gpus
-    warnings.warn("gather_object_multiple_gpu from mm_video.utils.train_utils is deprecated, "
-                  "please use gather_object_multiple_gpus from mm_video.utils.distributed instead",
-                  DeprecationWarning, stacklevel=2)
-    return gather_object_multiple_gpus(*args, **kwargs)
-
-
-def conditional_gather_object_multiple_gpu(*args, **kwargs):
-    from .distributed import conditional_gather_object_multiple_gpus
-    warnings.warn("conditional_gather_object_multiple_gpu from mm_video.utils.train_utils is deprecated, "
-                  "please use conditional_gather_object_multiple_gpus from mm_video.utils.distributed instead",
-                  DeprecationWarning, stacklevel=2)
-    return conditional_gather_object_multiple_gpus(*args, **kwargs)
 
 
 # from peft: https://github.com/huggingface/peft/blob/main/src/peft/peft_model.py

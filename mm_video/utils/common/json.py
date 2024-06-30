@@ -6,6 +6,7 @@
 
 import json
 from typing import Union, List, Dict
+
 from xopen import xopen
 
 

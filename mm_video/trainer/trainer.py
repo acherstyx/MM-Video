@@ -39,13 +39,13 @@ from functools import partial
 from mm_video.config import trainer_store
 from mm_video.modeling.meter import Meter, DummyMeter, GroupMeter
 from mm_video.modeling.optimization import get_linear_schedule_with_warmup
-from mm_video.utils.train_utils import (
+from mm_video.utils.common.train_utils import (
     CudaPreFetcher, get_trainable_parameters, compute_total_gradient_norm,
     save_rng_state, load_rng_state
 )
-from mm_video.utils.distributed import get_world_size, get_local_rank, get_master_addr, get_master_port, get_rank
-from mm_video.utils.writer import get_writer
-from mm_video.utils.profile import Timer
+from mm_video.utils.common.distributed import get_world_size, get_local_rank, get_master_addr, get_master_port, get_rank
+from mm_video.utils.common.writer import get_writer
+from mm_video.utils.common.time import Timer
 
 from .trainer_utils import barrier, get_module_class_from_name, load_state_dict, unwrap_model, get_write_freq, \
     has_length

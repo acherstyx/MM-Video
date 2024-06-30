@@ -13,7 +13,7 @@ from torch.utils.data import Dataset
 from mm_video.trainer.trainer_utils import manual_seed
 from mm_video.config import BaseConfig, runner_store
 from mm_video.modeling.meter import Meter
-from mm_video.utils.profile import Timer
+from mm_video.utils.common.time import Timer
 
 import logging
 

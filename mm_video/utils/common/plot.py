@@ -7,9 +7,9 @@
 import io
 from typing import Union, List, Any
 
-import torch
 import matplotlib.pyplot as plt
 import pandas as pd
+import torch
 from PIL import Image
 from torchvision.transforms import ToTensor
 

@@ -7,9 +7,8 @@
 import unittest
 
 import numpy as np
-import matplotlib.pyplot as plt
 
-from mm_video.utils.plot import *
+from mm_video.utils.common.plot import *
 
 
 class TestShowDistribution(unittest.TestCase):
