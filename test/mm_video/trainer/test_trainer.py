@@ -4,21 +4,27 @@
 # @Project : MM-Video
 # @File    : test_trainer.py
 import logging
-import unittest
 import os
-from torch.utils.data import Dataset
-from torchvision import datasets, transforms
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import tempfile
+import unittest
+from pathlib import Path
+
+import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+from torchvision import datasets, transforms
 
-from mm_video.trainer.trainer import *
-from mm_video.trainer.training_configs import *
 from mm_video.modeling.meter import DummyMeter
+from mm_video.trainer.trainer import *
 from mm_video.trainer.trainer_utils import manual_seed
+from mm_video.trainer.training_configs import *
+from mm_video.utils.common.path import DisplayablePath
+
+BATCH_SIZE = 16
+SAVE_STEPS = 100
 
 
 # Test dataset
@@ -35,7 +41,7 @@ class MNISTDataset(Dataset):
         )
 
     def __len__(self):
-        return 100
+        return len(self.dataset)
 
     def __getitem__(self, idx):
         return self.dataset[idx]
@@ -79,10 +85,12 @@ def run_train(rank, world_size, output_dir, resume_from_checkpoint):
     os.environ["WORLD_SIZE"] = str(world_size)
 
     training_cfg = TrainingConfig(
-        num_train_epochs=2, save_steps=10, logging_steps=1, eval_steps=10,
+        num_train_epochs=3, save_steps=SAVE_STEPS, logging_steps=1,
         resume_from_checkpoint=resume_from_checkpoint
     )
-    dataloader_cfg = DataLoaderConfig(num_workers=0)
+    dataloader_cfg = DataLoaderConfig(
+        num_workers=0, train_batch_size=BATCH_SIZE, eval_batch_size=BATCH_SIZE, drop_last=True
+    )
     training_strategy_cfg = TrainingStrategyConfig(strategy=TrainingStrategy.DDP)
     debug_cfg = DebugConfig(
         enable=True, max_train_steps=9999, max_eval_steps=9999, max_test_steps=9999,
@@ -102,17 +110,20 @@ def run_train(rank, world_size, output_dir, resume_from_checkpoint):
         debug=debug_cfg
     )
     trainer.train()
-    print(f"{output_dir}:", os.listdir(output_dir))
+    paths = DisplayablePath.make_tree(Path(output_dir))
+    if dist.get_rank() == 0:
+        for path in paths:
+            print(path.displayable())
 
 
 class TestTrainerResume(unittest.TestCase):
 
     @unittest.skipIf(not torch.cuda.is_available(), "GPU is required to run this test")
     def test_resume_from_checkpoint_distributed(self):
-        world_size = 2
-        len_train_dataset = len(MNISTDataset(split="train")) // world_size
-        load_steps = int((len_train_dataset * 1.5)) // 10 * 10
-        last_checkpoint_step = int((len_train_dataset * 2)) // 10 * 10
+        world_size = 4
+        len_train_dataset = len(MNISTDataset(split="train")) // world_size // BATCH_SIZE
+        load_steps = int((len_train_dataset * 1.5)) // SAVE_STEPS * SAVE_STEPS
+        last_checkpoint_step = int((len_train_dataset * 2)) // SAVE_STEPS * SAVE_STEPS
         with tempfile.TemporaryDirectory() as tmpdir:
             mp.spawn(run_train, args=(world_size, os.path.join(tmpdir, "train_1"), None), nprocs=world_size)
             mp.spawn(
@@ -140,4 +151,4 @@ class TestTrainerResume(unittest.TestCase):
             for log_before, log_after in zip(state_before.log_history, state_after.log_history):
                 self.assertEqual(log_before["step"], log_after["step"])
                 self.assertEqual(log_before["loss"], log_after["loss"],
-                                 msg=f'Log not the same for step {log_before["step"]}')
+                                 msg=f'Log not the same for step {log_before["step"]}. Reusme: {load_steps}')

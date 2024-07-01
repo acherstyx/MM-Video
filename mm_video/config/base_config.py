@@ -4,11 +4,11 @@
 # @Project : MM-Video
 # @File    : base_config.py
 
-from hydra.core.config_store import ConfigStore
-
-from omegaconf import MISSING
 from dataclasses import dataclass, field
-from typing import List, Any, Optional
+from typing import Any, Optional
+
+from hydra.core.config_store import ConfigStore
+from omegaconf import MISSING
 
 """
 Define the structure of base configuration for this template
@@ -27,22 +27,13 @@ class SystemConfig:
 @dataclass
 class LogConfig:
     # info/metadata
-
-    root: str = "log"  # log root
+    root: str = "log"
     project_name: str = "unnamed_project"  # this should be set to determine the output directory
     experiment_name: str = "unnamed_experiment"  # this should be set to determine the output directory
 
 
 @dataclass
 class BaseConfig:
-    defaults: List[Any] = field(
-        default_factory=lambda: [
-            "_self_",
-            {"trainer": "Trainer"},
-            {"runner": "Runner"}
-        ]
-    )
-
     # Basic information configuration
     system: SystemConfig = field(default_factory=SystemConfig)
     log: LogConfig = field(default_factory=LogConfig)
@@ -58,4 +49,4 @@ class BaseConfig:
     runner: Any = MISSING
 
 
-ConfigStore.instance().store(name="mm_video_structured_config", node=BaseConfig)
+ConfigStore.instance().store(name="_mm_video_template", node=BaseConfig)

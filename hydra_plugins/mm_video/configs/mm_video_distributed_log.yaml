@@ -1,14 +1,4 @@
-# @package _global_
-defaults:
-  - mm_video_structured_config
-  - _self_
-
 hydra:
-  run:
-    dir: "${log.root}/${log.project_name}/${log.experiment_name}"
-  sweep:
-    dir: "${log.root}/${log.project_name}/${log.experiment_name}"
-    subdir: ${hydra.job.override_dirname}
   job_logging:
     version: 1
     formatters:

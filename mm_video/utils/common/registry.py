@@ -4,7 +4,6 @@
 # @Project : MM-Video
 # @File    : registry.py
 
-
 from typing import Any, Dict, Iterable, Iterator, Tuple
 
 from tabulate import tabulate

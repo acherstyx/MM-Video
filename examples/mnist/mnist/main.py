@@ -8,6 +8,10 @@ import os
 import hydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig
+# noinspection PyUnresolvedReferences
+import mm_video.runner
+# noinspection PyUnresolvedReferences
+import mm_video.trainer
 
 
 @hydra.main(version_base=None, config_name="config",

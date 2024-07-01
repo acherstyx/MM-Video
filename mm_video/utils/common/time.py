@@ -2,16 +2,16 @@
 # @Time    : 7/12/23
 # @Author  : Yaojie Shen
 # @Project : MM-Video
-# @File    : profile.py
-
-import time
-import logging
-import numpy as np
-import torch
-from collections import defaultdict, deque
+# @File    : time.py
+import datetime
 import functools
-from tabulate import tabulate
+import logging
+import time
+from collections import defaultdict, deque
 from typing import Callable, Dict, Optional
+
+import numpy as np
+from tabulate import tabulate
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,7 @@ class Timer(object):
         call `torch.cuda.synchronize()` and return rounded time in seconds
         :return: current time in seconds
         """
+        import torch
         if self.synchronize and torch.cuda.is_available():
             torch.cuda.synchronize()
         return round(time.time(), self.precision)
@@ -116,6 +117,10 @@ class Timer(object):
     def print(self):
         data = [[name, format_time(duration)] for name, duration in self.averaged_time_history.items()]
         print(tabulate(data, headers=["Stage", "Time (ms)"], tablefmt="simple"))
+
+
+def get_timestamp():
+    return datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
 
 
 if __name__ == '__main__':

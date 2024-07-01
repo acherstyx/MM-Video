@@ -13,8 +13,8 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
 ]
 dependencies = [
-    # Base framework
-    "mm-video@git+https://github.com/acherstyx/MM-Video@develop"
+    "mm-video@git+https://github.com/acherstyx/MM-Video@develop",
+    "hydra-torchrun-launcher@git+https://github.com/acherstyx/hydra-torchrun-launcher@main"
 ]
 
 [tool.setuptools.packages.find]
