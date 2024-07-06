@@ -5,6 +5,7 @@
 # @File    : __init__.py
 
 from .data import chunk
+from .debug import dump_return
 from .distributed import (
     get_rank,
     get_world_size,
