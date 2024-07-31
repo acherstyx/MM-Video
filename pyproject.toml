@@ -26,7 +26,7 @@ dependencies = [
 [project.optional-dependencies]
 utils_common = ["matplotlib", "pandas", "pillow", "tabulate", "xopen"]
 utils_vision = ["opencv-python", "joblib>=1.3.0"]
-utils_language = ["transformers", "vllm", "peft", "ray", "pydantic"]
+utils_language = ["transformers", "vllm<0.5", "peft", "ray", "pydantic"]
 tools = ["fire"]
 test = ["pytest", "pytest-cov"]
 

@@ -23,7 +23,8 @@ from vllm import LLM, SamplingParams, RequestOutput
 from mm_video.utils.common.data import chunk
 
 """
-Batch Generator
+Batch Generator for LLMs.
+Our optimization objective is primarily throughput, which is used to introduce generation in the training process.
 """
 
 logger = logging.getLogger(__name__)
@@ -125,7 +126,7 @@ class HFPipelineGenerator(Generator):
     ):
         """
         Generator based on HuggingFace pipeline.
-        Only support running on single GPU, do not support tensor parallel or data parallel (TBD).
+        Support pipeline parallel, do not support tensor parallel.
 
         :param model_name_or_path:
         :param model_init_kwargs:
@@ -255,9 +256,16 @@ class VLLMGenerator(Generator):
                     generate_kwargs: dict,
                     sampling_params_kwargs: dict
             ) -> List[RequestOutput]:
-                sampling_params = SamplingParams(**sampling_params_kwargs)
-
-                return self.model.generate(prompts, sampling_params, **generate_kwargs)
+                if "sampling_params" in generate_kwargs:
+                    if sampling_params_kwargs:
+                        logger.warning(
+                            "Values in sampling_params_kwargs will be ignored because sampling_params is specified in "
+                            "generate_kwargs."
+                        )
+                    return self.model.generate(prompts, **generate_kwargs)
+                else:
+                    sampling_params = SamplingParams(**sampling_params_kwargs)
+                    return self.model.generate(prompts, sampling_params, **generate_kwargs)
 
         # This is a strange workaround for running data parallel with vLLM.
         # vLLM hangs if tensor_parallel > 1 and resources are set in ray.remote
