@@ -4,12 +4,14 @@
 # @Project : MM-Video
 # @File    : image.py
 
+__all__ = [
+    "byte_imread",
+    "byte_imwrite"
+]
 
 from io import BytesIO
 
 from PIL import Image
-
-__all__ = ['byte_imread', "byte_imwrite"]
 
 
 def byte_imread(data):

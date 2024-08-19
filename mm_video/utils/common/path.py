@@ -4,7 +4,18 @@
 # @Project : MM-Video
 # @File    : path.py
 
+__all__ = [
+    "FilePath",
+    "FileOrPath",
+    "DisplayablePath",
+]
+
+import os
 from pathlib import Path
+from typing import IO, Union
+
+FilePath = Union[str, bytes, os.PathLike]
+FileOrPath = Union[FilePath, IO]
 
 
 # Source: https://stackoverflow.com/a/49912639

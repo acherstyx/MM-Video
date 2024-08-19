@@ -4,14 +4,27 @@
 # @Project : MM-Video
 # @File    : generate.py
 
+"""
+Batch Generator for LLMs.
+Our optimization objective is primarily throughput, which is used to introduce generation in the training process.
+"""
+
+__all__ = [
+    "Generator",
+    "HFGenerator",
+    "HFPipelineGenerator",
+    "VLLMGenerator",
+    "VLLMGeneratorFromLora"
+]
+
 import copy
 import itertools
 import logging
-import math
 import tempfile
 from abc import ABC, abstractmethod
 from typing import Optional, List, Union, Type
 
+import math
 import ray
 import torch
 import tqdm
@@ -21,11 +34,6 @@ from transformers import PreTrainedTokenizer, pipeline, AutoModelForCausalLM, Au
 from vllm import LLM, SamplingParams, RequestOutput
 
 from mm_video.utils.common.data import chunk
-
-"""
-Batch Generator for LLMs.
-Our optimization objective is primarily throughput, which is used to introduce generation in the training process.
-"""
 
 logger = logging.getLogger(__name__)
 

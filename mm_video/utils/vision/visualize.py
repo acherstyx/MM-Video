@@ -4,6 +4,10 @@
 # @Project : MM-Video
 # @File    : visualize.py
 
+__all__ = [
+    "inv_normalize"
+]
+
 import numpy as np
 import torch
 from PIL import Image

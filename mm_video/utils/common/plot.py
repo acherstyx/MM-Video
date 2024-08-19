@@ -4,6 +4,13 @@
 # @Project : MM-Video
 # @File    : plot.py
 
+
+__all__ = [
+    "fig_to_image",
+    "fig_to_tensor",
+    "show_distribution",
+]
+
 import io
 from typing import Union, List, Any
 
