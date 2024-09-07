@@ -4,10 +4,13 @@
 # @Project : MM-Video
 # @File    : test_generate.py
 
+from typing import List
+
+import torch
 from pytest import fixture, mark, param
+from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from mm_video.utils.language.generate import *
-from transformers import AutoTokenizer, PreTrainedTokenizer
 
 
 @fixture()
