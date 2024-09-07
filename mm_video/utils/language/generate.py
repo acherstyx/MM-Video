@@ -17,6 +17,7 @@ __all__ = [
     "VLLMGeneratorFromLora"
 ]
 
+import os
 import copy
 import itertools
 import logging
@@ -304,6 +305,7 @@ class VLLMGenerator(Generator):
             if "pipeline_parallel_size" in model_init_kwargs:
                 model_init_kwargs.pop("pipeline_parallel_size")
 
+            os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
             self.actors = VLLMGenerateActor(model_name_or_path, tokenizer, model_init_kwargs)
         else:
             logger.debug("Using custom pipeline parallel implementation for vLLM.")
