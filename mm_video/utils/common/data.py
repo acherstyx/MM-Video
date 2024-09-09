@@ -4,6 +4,10 @@
 # @Project : MM-Video
 # @File    : data.py
 
+__all__ = [
+    "chunk",
+]
+
 from typing import List, Any, Optional
 
 

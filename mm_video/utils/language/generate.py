@@ -4,14 +4,28 @@
 # @Project : MM-Video
 # @File    : generate.py
 
+"""
+Batch Generator for LLMs.
+Our optimization objective is primarily throughput, which is used to introduce generation in the training process.
+"""
+
+__all__ = [
+    "Generator",
+    "HFGenerator",
+    "HFPipelineGenerator",
+    "VLLMGenerator",
+    "VLLMGeneratorFromLora"
+]
+
+import os
 import copy
 import itertools
 import logging
-import math
 import tempfile
 from abc import ABC, abstractmethod
 from typing import Optional, List, Union, Type
 
+import math
 import ray
 import torch
 import tqdm
@@ -21,10 +35,6 @@ from transformers import PreTrainedTokenizer, pipeline, AutoModelForCausalLM, Au
 from vllm import LLM, SamplingParams, RequestOutput
 
 from mm_video.utils.common.data import chunk
-
-"""
-Batch Generator
-"""
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +135,7 @@ class HFPipelineGenerator(Generator):
     ):
         """
         Generator based on HuggingFace pipeline.
-        Only support running on single GPU, do not support tensor parallel or data parallel (TBD).
+        Support pipeline parallel, do not support tensor parallel.
 
         :param model_name_or_path:
         :param model_init_kwargs:
@@ -210,10 +220,10 @@ class VLLMGenerator(Generator):
             self,
             model_name_or_path: str,
             model_init_kwargs: Optional[dict] = None,
-            tokenizer: Optional[PreTrainedTokenizer] = None,
+            tokenizer: Optional[str] = None,
             sampling_params_kwargs: Optional[dict] = None,
             generate_kwargs: Optional[dict] = None,
-            json_schema: Optional[Type[BaseModel]] = None
+            json_schema: Optional[Type[BaseModel]] = None,
     ):
         """
         Running generate with vLLM. Will use all GPU with tensor parallel and data parallel enabled.
@@ -232,20 +242,28 @@ class VLLMGenerator(Generator):
         if generate_kwargs is None:
             generate_kwargs = {}
 
-        if "tensor_parallel_size" in model_init_kwargs:
-            tensor_parallel_size = model_init_kwargs["tensor_parallel_size"]
-        else:
-            tensor_parallel_size = 1
-        self.tensor_parallel_size = tensor_parallel_size
-
         self.default_sampling_params_kwargs = sampling_params_kwargs
         self.default_generate_kwargs = generate_kwargs
 
-        class _VLLMGenerateActor:
+        # configure lm-format-enforcer
+        if json_schema is not None:
+            from lmformatenforcer import JsonSchemaParser
+            from lmformatenforcer.integrations.vllm import build_vllm_logits_processor, \
+                build_vllm_token_enforcer_tokenizer_data
+
+            tokenizer_data = build_vllm_token_enforcer_tokenizer_data(
+                AutoTokenizer.from_pretrained(tokenizer) if tokenizer is not None else
+                AutoTokenizer.from_pretrained(model_name_or_path)
+            )
+            parser = JsonSchemaParser(json_schema.schema())
+            logits_processor = build_vllm_logits_processor(tokenizer_data, parser)
+            sampling_params_kwargs["logits_processors"] = [logits_processor]
+
+        class VLLMGenerateActor:
             def __init__(self, model_name_or_path, tokenizer, model_init_kwargs):
                 self.model = LLM(
                     model=model_name_or_path,
-                    tokenizer=model_name_or_path if tokenizer is not None else None,
+                    tokenizer=tokenizer,
                     **model_init_kwargs
                 )
 
@@ -255,59 +273,83 @@ class VLLMGenerator(Generator):
                     generate_kwargs: dict,
                     sampling_params_kwargs: dict
             ) -> List[RequestOutput]:
-                sampling_params = SamplingParams(**sampling_params_kwargs)
+                if "sampling_params" in generate_kwargs:
+                    if sampling_params_kwargs:
+                        logger.warning(
+                            "Values in sampling_params_kwargs will be ignored because sampling_params is specified in "
+                            "generate_kwargs."
+                        )
+                    return self.model.generate(prompts, **generate_kwargs)
+                else:
+                    sampling_params = SamplingParams(**sampling_params_kwargs)
+                    return self.model.generate(prompts, sampling_params, **generate_kwargs)
 
-                return self.model.generate(prompts, sampling_params, **generate_kwargs)
-
-        # This is a strange workaround for running data parallel with vLLM.
-        # vLLM hangs if tensor_parallel > 1 and resources are set in ray.remote
-        # Got "RuntimeError: No CUDA GPUs are available" if tp == 1 and resources are not set in ray.remote
-        # See https://github.com/vllm-project/vllm/issues/973
-        @ray.remote(num_gpus=1)
-        class _VLLMGenerateActorOnOneGPU(_VLLMGenerateActor):
-            pass
-
-        @ray.remote
-        class _VLLMGenerateActorOnMultipleGPU(_VLLMGenerateActor):
-            pass
-
-        # configure lm-format-enforcer
-        if json_schema is not None:
-            from lmformatenforcer import JsonSchemaParser
-            from lmformatenforcer.integrations.vllm import build_vllm_logits_processor, \
-                build_vllm_token_enforcer_tokenizer_data
-
-            tokenizer_data = build_vllm_token_enforcer_tokenizer_data(
-                tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(model_name_or_path)
-            )
-            parser = JsonSchemaParser(json_schema.schema())
-            logits_processor = build_vllm_logits_processor(tokenizer_data, parser)
-            sampling_params_kwargs["logits_processors"] = [logits_processor]
-
-        tp_size = tensor_parallel_size
-        dp_size = torch.cuda.device_count() // tp_size
-
-        logger.debug("tp_size: %s", tp_size)
-        logger.debug("dp_size: %s", dp_size)
-
-        if tp_size == 1:
-            # noinspection PyUnresolvedReferences
-            actors = [
-                _VLLMGenerateActorOnOneGPU.remote(model_name_or_path, tokenizer, model_init_kwargs)
-                for _ in range(dp_size)
-            ]
+        # Set `tensor_parallel_size` to 1 if not specified in `model_init_kwargs`.
+        if "tensor_parallel_size" in model_init_kwargs:
+            self.tensor_parallel_size = model_init_kwargs["tensor_parallel_size"]
         else:
-            actors = [
-                _VLLMGenerateActorOnMultipleGPU.remote(model_name_or_path, tokenizer, model_init_kwargs)
-                for _ in range(dp_size)
-            ]
-        self.actor_pool = ray.util.ActorPool(actors)
+            self.tensor_parallel_size = 1
+        # Set `pipeline_parallel_size` if not specified in `model_init_kwargs`.
+        if "pipeline_parallel_size" in model_init_kwargs:
+            self.pipeline_parallel_size = model_init_kwargs["pipeline_parallel_size"]
+        else:
+            # If not specified, we use all GPUs available.
+            self.pipeline_parallel_size = torch.cuda.device_count() // self.tensor_parallel_size
+            model_init_kwargs["pipeline_parallel_size"] = self.pipeline_parallel_size
+
+        if self.pipeline_parallel_size == 1:
+            logger.debug("Pipeline parallel is disabled since we have `pipeline_parallel_size=1`. Only start a single"
+                         "`LLM` instance to avoid any error from using `ray`.")
+
+            # Pop out pipeline parallel size, since this argument is not supported in previous version of vLLM
+            if "pipeline_parallel_size" in model_init_kwargs:
+                model_init_kwargs.pop("pipeline_parallel_size")
+
+            os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+            self.actors = VLLMGenerateActor(model_name_or_path, tokenizer, model_init_kwargs)
+        else:
+            logger.debug("Using custom pipeline parallel implementation for vLLM.")
+
+            # Pop out pipeline parallel size, since this argument is not supported in previous version of vLLM
+            if "pipeline_parallel_size" in model_init_kwargs:
+                model_init_kwargs.pop("pipeline_parallel_size")
+
+            # This is a workaround for running pipeline parallel with early version of vLLM.
+            # vLLM hangs if tensor_parallel > 1 and resources are set in ray.remote
+            # Got "RuntimeError: No CUDA GPUs are available" if tp == 1 and resources are not set in ray.remote
+            # See https://github.com/vllm-project/vllm/issues/973
+            @ray.remote(num_gpus=1)
+            class _VLLMGenerateActorOnOneGPU(VLLMGenerateActor):
+                pass
+
+            @ray.remote
+            class _VLLMGenerateActorOnMultipleGPU(VLLMGenerateActor):
+                pass
+
+            if self.tensor_parallel_size == 1:
+                # noinspection PyUnresolvedReferences
+                self.actors = [
+                    _VLLMGenerateActorOnOneGPU.remote(model_name_or_path, tokenizer, model_init_kwargs)
+                    for _ in range(self.pipeline_parallel_size)
+                ]
+            else:
+                self.actors = [
+                    _VLLMGenerateActorOnMultipleGPU.remote(model_name_or_path, tokenizer, model_init_kwargs)
+                    for _ in range(self.pipeline_parallel_size)
+                ]
+
+        logger.debug("vLLM generator tensor_parallel_size: %s", self.tensor_parallel_size)
+        logger.debug("vLLM generator pipeline_parallel_size: %s", self.pipeline_parallel_size)
 
     def ray_batch(self, args_list, ordered: bool = True):
-        if ordered:
-            return self.actor_pool.map(lambda a, v: a.generate.remote(*v), args_list)
+        if isinstance(self.actors, list):
+            actor_pool = ray.util.ActorPool(self.actors)
+            if ordered:
+                return actor_pool.map(lambda a, v: a.generate.remote(*v), args_list)
+            else:
+                return actor_pool.map_unordered(lambda a, v: a.generate.remote(*v), args_list)
         else:
-            return self.actor_pool.map_unordered(lambda a, v: a.generate.remote(*v), args_list)
+            return [self.actors.generate(*args) for args in args_list]
 
     @staticmethod
     def split_list(full_list, n_chunks):

@@ -4,23 +4,37 @@
 # @Project : MM-Video
 # @File    : json.py
 
+"""
+This file contains some utils for loading and saving JSON/JSONL files.
+"""
+
+__all__ = [
+    "load_json",
+    "save_json",
+    "JsonlReader",
+    "JsonlWriter",
+    "load_jsonl",
+    "save_jsonl"
+]
+
+import copy
 import json
-from typing import Union, List, Dict
+from typing import Union, List, Dict, Iterable
 
 from xopen import xopen
 
 
-def load_json(file_path: str):
-    with open(file_path, "r") as f:
+def load_json(filename):
+    with xopen(filename, "r") as f:
         return json.load(f)
 
 
-def save_json(data: Union[List, Dict], filename: str, save_pretty: bool = False, **kwargs):
-    with open(filename, "w") as f:
+def save_json(data: Union[List, Dict], filename, save_pretty: bool = False, **kwargs):
+    with xopen(filename, "w") as f:
         if save_pretty:
-            f.write(json.dumps(data, indent=4, **kwargs))
-        else:
-            json.dump(data, f, **kwargs)
+            kwargs = copy.deepcopy(kwargs)
+            kwargs.update({"indent": 4})
+        json.dump(data, f, **kwargs)
 
 
 class JsonlReader:
@@ -76,3 +90,13 @@ class JsonlWriter:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+
+
+def load_jsonl(filename) -> List[Union[List, Dict]]:
+    return JsonlReader(filename).to_list()
+
+
+def save_jsonl(data: List[Union[Dict, List, Iterable]], filename):
+    with JsonlWriter(filename) as writer:
+        for d in data:
+            writer.write(d)

@@ -4,6 +4,11 @@
 # @Project : MM-Video
 # @File    : writer.py
 
+__all__ = [
+    "DummySummaryWriter",
+    "get_writer"
+]
+
 import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
 

@@ -4,6 +4,10 @@
 # @Project : MM-Video
 # @File    : video.py
 
+__all__ = [
+    "get_duration_info",
+    "convert_video"
+]
 
 import os
 import subprocess
@@ -11,8 +15,6 @@ from typing import *
 
 import cv2
 from joblib import Parallel, delayed
-
-__all__ = ["get_duration_info", "convert_video"]
 
 
 def _get_single_video_duration_info(video_path) -> (float, float, int):

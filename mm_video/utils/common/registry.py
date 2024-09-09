@@ -4,6 +4,13 @@
 # @Project : MM-Video
 # @File    : registry.py
 
+__all__ = [
+    "Registry",
+    "LooseRegistry",
+    "PrefixRegistry",
+    "PostfixRegistry",
+]
+
 from typing import Any, Dict, Iterable, Iterator, Tuple
 
 from tabulate import tabulate

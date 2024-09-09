@@ -3,6 +3,13 @@
 # @Author  : Yaojie Shen
 # @Project : MM-Video
 # @File    : time.py
+
+__all__ = [
+    "format_time",
+    "Timer",
+    "timestamp",
+]
+
 import datetime
 import functools
 import logging
@@ -119,7 +126,7 @@ class Timer(object):
         print(tabulate(data, headers=["Stage", "Time (ms)"], tablefmt="simple"))
 
 
-def get_timestamp():
+def timestamp():
     return datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
 
 
